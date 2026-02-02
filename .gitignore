@@ -1,0 +1,36 @@
+# Build outputs
+build/
+out/
+target/
+
+# Gradle
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+.vscode/
+
+# Node
+node_modules/
+src/main/resources/META-INF/frontend/vaadin-ckeditor/node_modules/
+
+# Claude/AI tools
+.claude/
+.ace-tool/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local config
+local.properties

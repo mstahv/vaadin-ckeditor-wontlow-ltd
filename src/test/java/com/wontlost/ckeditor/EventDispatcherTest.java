@@ -1,0 +1,253 @@
+package com.wontlost.ckeditor;
+
+import com.wontlost.ckeditor.internal.EventDispatcher;
+import com.wontlost.ckeditor.handler.ErrorHandler;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.DisplayName;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for EventDispatcher.
+ * 注意：由于 ComponentEvent 需要非空的源组件，
+ * 而创建 VaadinCKEditor 实例需要 Vaadin 测试环境，
+ * 此测试类仅测试不依赖事件触发的功能。
+ */
+class EventDispatcherTest {
+
+    private EventDispatcher dispatcher;
+
+    @BeforeEach
+    void setUp() {
+        // 使用 null 作为 source
+        // 注意：事件触发测试需要在集成测试中进行
+        dispatcher = new EventDispatcher(null);
+    }
+
+    // ==================== ErrorHandler 测试 ====================
+
+    @Test
+    @DisplayName("setErrorHandler and getErrorHandler should work")
+    void setAndGetErrorHandler() {
+        assertNull(dispatcher.getErrorHandler());
+
+        ErrorHandler handler = err -> false;
+        dispatcher.setErrorHandler(handler);
+
+        assertEquals(handler, dispatcher.getErrorHandler());
+    }
+
+    @Test
+    @DisplayName("setErrorHandler should allow null")
+    void setErrorHandlerAllowsNull() {
+        ErrorHandler handler = err -> false;
+        dispatcher.setErrorHandler(handler);
+        assertNotNull(dispatcher.getErrorHandler());
+
+        dispatcher.setErrorHandler(null);
+        assertNull(dispatcher.getErrorHandler());
+    }
+
+    // ==================== 监听器注册测试 ====================
+
+    @Test
+    @DisplayName("addEditorReadyListener should register and return registration")
+    void addEditorReadyListenerReturnsRegistration() {
+        var registration = dispatcher.addEditorReadyListener(event -> {});
+        assertNotNull(registration);
+
+        assertEquals(1, dispatcher.getListenerStats().ready);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().ready);
+    }
+
+    @Test
+    @DisplayName("addEditorErrorListener should register and return registration")
+    void addEditorErrorListenerReturnsRegistration() {
+        var registration = dispatcher.addEditorErrorListener(event -> {});
+        assertNotNull(registration);
+
+        assertEquals(1, dispatcher.getListenerStats().error);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().error);
+    }
+
+    @Test
+    @DisplayName("addAutosaveListener should register and return registration")
+    void addAutosaveListenerReturnsRegistration() {
+        var registration = dispatcher.addAutosaveListener(event -> {});
+        assertNotNull(registration);
+
+        assertEquals(1, dispatcher.getListenerStats().autosave);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().autosave);
+    }
+
+    @Test
+    @DisplayName("addContentChangeListener should register and return registration")
+    void addContentChangeListenerReturnsRegistration() {
+        var registration = dispatcher.addContentChangeListener(event -> {});
+        assertNotNull(registration);
+
+        assertEquals(1, dispatcher.getListenerStats().contentChange);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().contentChange);
+    }
+
+    @Test
+    @DisplayName("addFallbackListener should register and return registration")
+    void addFallbackListenerReturnsRegistration() {
+        var registration = dispatcher.addFallbackListener(event -> {});
+        assertNotNull(registration);
+
+        assertEquals(1, dispatcher.getListenerStats().fallback);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().fallback);
+    }
+
+    // ==================== 多监听器测试 ====================
+
+    @Test
+    @DisplayName("Multiple listeners of same type should be tracked")
+    void multipleListenersTracked() {
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorReadyListener(event -> {});
+
+        assertEquals(3, dispatcher.getListenerStats().ready);
+    }
+
+    @Test
+    @DisplayName("Listeners of different types should be tracked separately")
+    void differentListenerTypesTracked() {
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorErrorListener(event -> {});
+        dispatcher.addAutosaveListener(event -> {});
+
+        var stats = dispatcher.getListenerStats();
+        assertEquals(1, stats.ready);
+        assertEquals(1, stats.error);
+        assertEquals(1, stats.autosave);
+        assertEquals(0, stats.contentChange);
+        assertEquals(0, stats.fallback);
+    }
+
+    // ==================== 统计信息测试 ====================
+
+    @Test
+    @DisplayName("getListenerStats should return correct totals")
+    void getListenerStatsReturnsCorrectTotals() {
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorErrorListener(event -> {});
+        dispatcher.addAutosaveListener(event -> {});
+        dispatcher.addContentChangeListener(event -> {});
+        dispatcher.addFallbackListener(event -> {});
+
+        EventDispatcher.ListenerStats stats = dispatcher.getListenerStats();
+
+        assertEquals(2, stats.ready);
+        assertEquals(1, stats.error);
+        assertEquals(1, stats.autosave);
+        assertEquals(1, stats.contentChange);
+        assertEquals(1, stats.fallback);
+        assertEquals(6, stats.total());
+    }
+
+    @Test
+    @DisplayName("ListenerStats.total should sum all listeners")
+    void listenerStatsTotalSumsAll() {
+        // 初始状态
+        assertEquals(0, dispatcher.getListenerStats().total());
+
+        // 添加监听器
+        dispatcher.addEditorReadyListener(event -> {});
+        assertEquals(1, dispatcher.getListenerStats().total());
+
+        dispatcher.addEditorErrorListener(event -> {});
+        assertEquals(2, dispatcher.getListenerStats().total());
+    }
+
+    // ==================== 清理测试 ====================
+
+    @Test
+    @DisplayName("cleanup should remove all listeners")
+    void cleanupRemovesAllListeners() {
+        dispatcher.addEditorReadyListener(event -> {});
+        dispatcher.addEditorErrorListener(event -> {});
+        dispatcher.addAutosaveListener(event -> {});
+        dispatcher.addContentChangeListener(event -> {});
+        dispatcher.addFallbackListener(event -> {});
+
+        assertEquals(5, dispatcher.getListenerStats().total());
+
+        dispatcher.cleanup();
+
+        assertEquals(0, dispatcher.getListenerStats().total());
+        assertEquals(0, dispatcher.getListenerStats().ready);
+        assertEquals(0, dispatcher.getListenerStats().error);
+        assertEquals(0, dispatcher.getListenerStats().autosave);
+        assertEquals(0, dispatcher.getListenerStats().contentChange);
+        assertEquals(0, dispatcher.getListenerStats().fallback);
+    }
+
+    @Test
+    @DisplayName("cleanup should be safe to call multiple times")
+    void cleanupSafeToCallMultipleTimes() {
+        dispatcher.addEditorReadyListener(event -> {});
+
+        assertDoesNotThrow(() -> {
+            dispatcher.cleanup();
+            dispatcher.cleanup();
+            dispatcher.cleanup();
+        });
+    }
+
+    @Test
+    @DisplayName("cleanup on empty dispatcher should not throw")
+    void cleanupOnEmptyDoesNotThrow() {
+        assertDoesNotThrow(() -> dispatcher.cleanup());
+    }
+
+    // ==================== Registration 测试 ====================
+
+    @Test
+    @DisplayName("Registration.remove should be idempotent")
+    void registrationRemoveIdempotent() {
+        var registration = dispatcher.addEditorReadyListener(event -> {});
+        assertEquals(1, dispatcher.getListenerStats().ready);
+
+        registration.remove();
+        assertEquals(0, dispatcher.getListenerStats().ready);
+
+        // 多次调用不应抛出异常
+        assertDoesNotThrow(() -> registration.remove());
+        assertEquals(0, dispatcher.getListenerStats().ready);
+    }
+
+    @Test
+    @DisplayName("Multiple registrations should be independent")
+    void multipleRegistrationsIndependent() {
+        AtomicBoolean listener1Removed = new AtomicBoolean(false);
+        AtomicBoolean listener2Removed = new AtomicBoolean(false);
+
+        var reg1 = dispatcher.addEditorReadyListener(event -> {});
+        var reg2 = dispatcher.addEditorReadyListener(event -> {});
+
+        assertEquals(2, dispatcher.getListenerStats().ready);
+
+        reg1.remove();
+        assertEquals(1, dispatcher.getListenerStats().ready);
+
+        reg2.remove();
+        assertEquals(0, dispatcher.getListenerStats().ready);
+    }
+}

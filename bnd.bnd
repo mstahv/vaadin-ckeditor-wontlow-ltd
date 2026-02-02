@@ -1,0 +1,17 @@
+# OSGi Bundle Configuration for Vaadin CKEditor
+# Enables hot deployment in OSGi containers
+
+Bundle-Name: VaadinCKEditor
+Bundle-SymbolicName: com.wontlost.vaadin-ckeditor
+
+# Export all public packages for Vaadin component discovery
+Export-Package: \
+    com.wontlost.ckeditor,\
+    com.wontlost.ckeditor.event,\
+    com.wontlost.ckeditor.handler
+
+# Import all required packages dynamically
+Import-Package: *
+
+# Vaadin OSGi Extender - enables automatic component registration
+Vaadin-OSGi-Extender: true

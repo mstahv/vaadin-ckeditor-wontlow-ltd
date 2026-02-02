@@ -1,0 +1,22 @@
+{
+  "name": "vaadin-ckeditor",
+  "version": "5.0.0",
+  "description": "Vaadin CKEditor 5 Web Component",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ckeditor5": "^47.4.0",
+    "lit": "^3.3.2"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^3.1.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.1.0"
+  }
+}

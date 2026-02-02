@@ -1,0 +1,193 @@
+/**
+ * Sticky Toolbar CSS for Vaadin CKEditor 5
+ *
+ * This file contains styles to make the CKEditor toolbar sticky when scrolling.
+ * Required because CKEditor renders in light DOM, not shadow DOM.
+ * See: https://github.com/ckeditor/ckeditor5/issues/1133
+ */
+
+/* ==================== Sticky Toolbar Base Styles ==================== */
+
+/* CRITICAL: Ensure all ancestor elements allow sticky to work
+ * position:sticky requires overflow:visible on all ancestors
+ * between the sticky element and the scroll container.
+ * We target both the component itself and common wrapper patterns. */
+vaadin-ckeditor,
+vaadin-ckeditor .ck.ck-editor {
+    overflow: visible !important;
+}
+
+/* Editor main area needs overflow-x:hidden to clip editable content
+ * to match toolbar width (editable uses content-box with padding).
+ * overflow-y must remain visible for sticky toolbar to work. */
+vaadin-ckeditor .ck.ck-editor__main {
+    overflow-x: hidden !important;
+    overflow-y: visible !important;
+}
+
+/* Also target common parent wrapper patterns used in applications.
+ * Note: :has() selector ensures we only affect containers that actually contain vaadin-ckeditor */
+.editor-container:has(vaadin-ckeditor),
+div:has(> vaadin-ckeditor) {
+    overflow: visible !important;
+}
+
+/* Make the top section (containing toolbar) sticky
+ * Use --ck-sticky-toolbar-offset to adjust for scroll container padding
+ * Default is 0, applications can set this CSS variable as needed */
+vaadin-ckeditor .ck.ck-editor .ck.ck-editor__top {
+    position: sticky !important;
+    top: var(--ck-sticky-toolbar-offset, 0px) !important;
+    z-index: 100 !important;
+    background: var(--ck-color-toolbar-background, #fff) !important;
+}
+
+/* Make sure the sticky panel container doesn't interfere */
+vaadin-ckeditor .ck.ck-editor .ck.ck-sticky-panel {
+    position: static !important;
+}
+
+/* ==================== Dark Theme Support ==================== */
+/* Supports both Vaadin's [theme~="dark"] and component's data-ck-theme="dark" */
+
+/* Dark mode sticky toolbar background */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-editor .ck.ck-editor__top,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-editor .ck.ck-editor__top {
+    background: var(--ck-color-toolbar-background, #374151) !important;
+}
+
+/* Toolbar styling */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-toolbar,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-toolbar {
+    background: #374151 !important;
+    border-color: #4b5563 !important;
+}
+
+/* Toolbar buttons */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-toolbar .ck-button,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-toolbar .ck-button {
+    color: #e5e7eb !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-toolbar .ck-button:hover:not(.ck-disabled),
+html[theme~="dark"] vaadin-ckeditor .ck.ck-toolbar .ck-button:hover:not(.ck-disabled) {
+    background: rgba(255, 255, 255, 0.1) !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-toolbar .ck-button.ck-on,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-toolbar .ck-button.ck-on {
+    background: #3b82f6 !important;
+    color: white !important;
+}
+
+/* Toolbar icons */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-icon,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-button .ck-icon,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-icon,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-button .ck-icon {
+    color: #d1d5db !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-button:not(.ck-disabled):hover .ck-icon,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-button:not(.ck-disabled):hover .ck-icon {
+    color: #f3f4f6 !important;
+}
+
+/* Dropdown button labels */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-toolbar .ck-dropdown__button .ck-button__label,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-toolbar .ck-dropdown__button .ck-button__label {
+    color: #e5e7eb !important;
+}
+
+/* Dropdown panels */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-dropdown__panel,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-dropdown__panel {
+    background: #374151 !important;
+    border-color: #4b5563 !important;
+}
+
+/* Lists in dropdowns */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-list,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-list {
+    background: #374151 !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-list__item .ck-button,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-list__item .ck-button {
+    color: #e5e7eb !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-list__item .ck-button:hover:not(.ck-disabled),
+html[theme~="dark"] vaadin-ckeditor .ck.ck-list__item .ck-button:hover:not(.ck-disabled) {
+    background: rgba(255, 255, 255, 0.1) !important;
+}
+
+/* Editor container backgrounds */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-editor,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-reset.ck-editor,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-editor__main,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-editor,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-reset.ck-editor,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-editor__main {
+    background: #1f2937 !important;
+}
+
+/* Editable content area */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-editor__editable:not(.ck-editor__nested-editable),
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-editor__editable:not(.ck-editor__nested-editable),
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content {
+    background: #1f2937 !important;
+    color: #f3f4f6 !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-editor__editable.ck-focused,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-editor__editable.ck-focused {
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.3) !important;
+}
+
+/* Content typography */
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content p,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content li,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content p,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content li {
+    color: #e5e7eb !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h1,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h2,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h3,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h4,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h5,
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content h6,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h1,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h2,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h3,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h4,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h5,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content h6 {
+    color: #f9fafb !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content a,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content a {
+    color: #60a5fa !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content blockquote,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content blockquote {
+    border-left-color: #4b5563 !important;
+    color: #9ca3af !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content code,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content code {
+    background: #374151 !important;
+    color: #fbbf24 !important;
+}
+
+vaadin-ckeditor[data-ck-theme="dark"] .ck.ck-content pre,
+html[theme~="dark"] vaadin-ckeditor .ck.ck-content pre {
+    background: #111827 !important;
+    color: #e5e7eb !important;
+}
