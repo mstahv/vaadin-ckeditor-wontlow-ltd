@@ -13,6 +13,16 @@ import static org.assertj.core.api.Assertions.*;
  */
 class VaadinCKEditorBuilderTest {
 
+    private static final String[] INVALID_LANGUAGES = {
+        "",
+        "eng",
+        "e",
+        "en_US",
+        "en-USA",
+        "123",
+        "en-"
+    };
+
     @Test
     @DisplayName("AUTO_RESOLVE mode should automatically add missing dependencies")
     void autoResolveShouldAddMissingDependencies() {
@@ -342,9 +352,8 @@ class VaadinCKEditorBuilderTest {
     @Test
     @DisplayName("Builder should reject invalid language codes")
     void builderShouldRejectInvalidLanguageCodes() {
-        String[] invalidLanguages = {"", "eng", "e", "en_US", "en-USA", "123", "en-"};
 
-        for (String lang : invalidLanguages) {
+        for (String lang : INVALID_LANGUAGES) {
             VaadinCKEditorBuilder builder = VaadinCKEditor.create()
                 .withPreset(CKEditorPreset.BASIC);
 
