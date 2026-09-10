@@ -18,7 +18,19 @@ import static com.wontlost.ckeditor.JsonUtil.*;
  */
 public class CKEditorConfig {
 
-    private final Map<String, JsonNode> configs = new LinkedHashMap<>();
+    /**
+     * 配置项存储。
+     *
+     * <p>用 {@code synchronizedMap} 包裹 {@link LinkedHashMap}：既保留插入顺序
+     * （前端配置的键序需稳定，故不能换成 ConcurrentHashMap），又避免并发写入时
+     * 静默丢数据——实测 8 线程各写 2 万个不同 key 时，无同步版本会丢失约 3 万次写入
+     * 且不抛任何异常，同时 LinkedHashMap 在并发扩容下还可能破坏内部链表结构。</p>
+     *
+     * <p>注意：对本 map 的迭代必须在 {@code synchronized (configs)} 块内进行
+     * （synchronizedMap 的迭代器不自带同步）。</p>
+     */
+    private final Map<String, JsonNode> configs =
+        java.util.Collections.synchronizedMap(new LinkedHashMap<>());
 
     /**
      * Whether to allow private/internal network addresses as upload URLs (for development environments)
@@ -222,10 +234,63 @@ public class CKEditorConfig {
      * Set media embed configuration
      */
     public CKEditorConfig setMediaEmbed(boolean previewsInData) {
-        ObjectNode mediaObj = createObjectNode();
+        ObjectNode mediaObj = getOrCreateMediaEmbed();
         mediaObj.put("previewsInData", previewsInData);
         configs.put("mediaEmbed", mediaObj);
         return this;
+    }
+
+    /**
+     * 启用/禁用嵌入媒体（视频等）的拖拽缩放（issue #71）。
+     *
+     * <p>启用后，选中嵌入媒体会显示四角缩放手柄，可按比例调整宽度。底层由 CKEditor 的
+     * {@code MediaEmbedResize} 插件实现——前端按需从 umbrella {@code ckeditor5} 包取用
+     * （实测 48.4.0 与 48.5.0 的 umbrella 产物中均不含该符号，届时静默降级为不可缩放），
+     * 但属功能性 premium（其 {@code MediaEmbedResizeEditing} 依赖 {@code isPremiumPlugin=true}），
+     * 故前端在启用时才按需从 {@code ckeditor5} 动态加载，加载失败（如缺商业 license）静默降级，
+     * 无需消费端额外配置。缩放数据以 {@code media_resized} class + 内联
+     * width 写入 {@code <figure>}，与 {@code previewsInData} 设置无关。</p>
+     *
+     * @param resizable true 启用拖拽缩放
+     * @return this
+     */
+    public CKEditorConfig setMediaEmbedResizable(boolean resizable) {
+        ObjectNode mediaObj = getOrCreateMediaEmbed();
+        mediaObj.put("resizable", resizable);
+        configs.put("mediaEmbed", mediaObj);
+        return this;
+    }
+
+    /**
+     * 设置嵌入媒体的浮动工具栏按钮（写入 {@code config.mediaEmbed.toolbar}）。
+     *
+     * <p>{@code MediaEmbedStyle}（对齐/排版样式）注册的按钮（如
+     * {@code mediaEmbed:alignLeft} / {@code mediaEmbed:alignCenter} /
+     * {@code mediaEmbed:alignRight}）须放入 {@code config.mediaEmbed.toolbar}，
+     * 而非顶层 {@code config.toolbar}；配合 {@code MEDIA_EMBED_TOOLBAR} 插件，
+     * 选中媒体时这些按钮才会出现在浮动工具栏上。</p>
+     *
+     * <p>传入空数组或 {@code null} 不写入 toolbar 字段，避免产生空数组配置。</p>
+     *
+     * @param items 工具栏按钮名称
+     * @return this config for chaining
+     */
+    public CKEditorConfig setMediaEmbedToolbar(String... items) {
+        ArrayNode arr = toArrayNodeOrNull(items);
+        if (arr != null) {
+            ObjectNode mediaObj = getOrCreateMediaEmbed();
+            mediaObj.set("toolbar", arr);
+            configs.put("mediaEmbed", mediaObj);
+        }
+        return this;
+    }
+
+    private ObjectNode getOrCreateMediaEmbed() {
+        JsonNode existing = configs.get("mediaEmbed");
+        if (existing != null && existing.isObject()) {
+            return (ObjectNode) existing;
+        }
+        return createObjectNode();
     }
 
     /**
@@ -268,7 +333,8 @@ public class CKEditorConfig {
             this.left = left;
         }
 
-        ObjectNode toJson() {
+        // review: 统一为 public，与其它内部配置类的 toJson()（HeadingOption/CodeBlockLanguage 等）一致
+        public ObjectNode toJson() {
             ObjectNode obj = createObjectNode();
             if (top != null) obj.put("top", top);
             if (right != null) obj.put("right", right);
@@ -853,10 +919,21 @@ public class CKEditorConfig {
     }
 
     /**
-     * Get configuration map
+     * 获取配置项快照。
+     *
+     * <p>返回的是深拷贝快照：{@code unmodifiableMap} 只能阻止增删键，
+     * 并不能阻止调用方修改 map 中的可变 {@link JsonNode} 子节点，
+     * 那样会绕过封装直接改动真实配置。同时深拷贝也避免了把内部
+     * synchronizedMap 的视图暴露出去（其迭代需外部加锁）。</p>
+     *
+     * @return 配置项的不可变深拷贝快照
      */
     public Map<String, JsonNode> getConfigs() {
-        return Collections.unmodifiableMap(configs);
+        Map<String, JsonNode> snapshot = new LinkedHashMap<>();
+        synchronized (configs) {
+            configs.forEach((key, value) -> snapshot.put(key, value == null ? null : value.deepCopy()));
+        }
+        return Collections.unmodifiableMap(snapshot);
     }
 
     /**
@@ -864,7 +941,13 @@ public class CKEditorConfig {
      */
     public ObjectNode toJson() {
         ObjectNode json = createObjectNode();
-        configs.forEach(json::set);
+        // 1) 必须在 synchronized 块内迭代：configs 是 synchronizedMap，其迭代器不自带同步。
+        // 2) 必须 deepCopy：直接 set 会让返回的「快照」与内部配置共享同一批可变子节点，
+        //    调用方对返回值的修改会反向污染真实配置
+        //    （例如 ((ArrayNode) cfg.toJson().get("toolbar")).add("EVIL") 会真的改掉工具栏）。
+        synchronized (configs) {
+            configs.forEach((key, value) -> json.set(key, value == null ? null : value.deepCopy()));
+        }
         return json;
     }
 
@@ -1165,6 +1248,19 @@ public class CKEditorConfig {
     }
 
     /**
+     * Check if media embed drag-to-resize is enabled.
+     *
+     * @return true if resizable is enabled, false otherwise
+     */
+    public boolean isMediaEmbedResizable() {
+        JsonNode node = configs.get("mediaEmbed");
+        if (node != null && node.isObject() && node.has("resizable")) {
+            return node.get("resizable").asBoolean();
+        }
+        return false;
+    }
+
+    /**
      * Check if HTML support allows all elements.
      *
      * @return true if HTML support is configured with allow all, false otherwise
@@ -1201,6 +1297,25 @@ public class CKEditorConfig {
         if (node.has("buttonOnBackground")) builder.buttonOnBackground(node.get("buttonOnBackground").asString());
         if (node.has("buttonOnColor")) builder.buttonOnColor(node.get("buttonOnColor").asString());
         if (node.has("iconColor")) builder.iconColor(node.get("iconColor").asString());
+
+        // 逐个还原 per-button 样式。
+        // 此前只读上面 9 个标量字段而漏掉 buttonStyles，导致
+        // setToolbarStyle(getToolbarStyle()) 这类「读-改-写」会永久丢失全部按钮样式。
+        // 键名与 ButtonStyle.toJson() 保持一一对应。
+        JsonNode buttonStyles = node.get("buttonStyles");
+        if (buttonStyles != null && buttonStyles.isObject()) {
+            buttonStyles.forEachEntry((buttonName, bs) -> {
+                if (bs == null || !bs.isObject()) {
+                    return;
+                }
+                ButtonStyle.Builder bsBuilder = ButtonStyle.builder();
+                if (bs.has("background")) bsBuilder.background(bs.get("background").asString());
+                if (bs.has("hoverBackground")) bsBuilder.hoverBackground(bs.get("hoverBackground").asString());
+                if (bs.has("activeBackground")) bsBuilder.activeBackground(bs.get("activeBackground").asString());
+                if (bs.has("iconColor")) bsBuilder.iconColor(bs.get("iconColor").asString());
+                builder.buttonStyle(buttonName, bsBuilder.build());
+            });
+        }
         return builder.build();
     }
 
@@ -1233,7 +1348,10 @@ public class CKEditorConfig {
      * @return the JSON node, or null if not set
      */
     public JsonNode getJsonNode(String key) {
-        return configs.get(key);
+        // 返回深拷贝：JsonNode 可变，直接交出内部节点会让调用方绕过本类封装
+        // 直接改动真实配置（与 toJson()/getConfigs() 的处理保持一致）。
+        JsonNode node = configs.get(key);
+        return node == null ? null : node.deepCopy();
     }
 
     /**

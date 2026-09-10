@@ -176,6 +176,18 @@ class VaadinCKEditorIntegrationTest {
         }
 
         @Test
+        @DisplayName("caret/focus API (issue #52) is callable without throwing")
+        void testCaretAndFocusApi() {
+            // 这些方法委托给客户端 executeJs；无 UI 时安全 no-op，不应抛异常。
+            // 真实光标/聚焦行为由 e2e 在浏览器中验证。
+            assertDoesNotThrow(() -> {
+                editor.setCaretToStart();
+                editor.setCaretToEnd();
+                editor.focusEditor();
+            });
+        }
+
+        @Test
         @DisplayName("getPlainText should extract plain text")
         void testGetPlainText() {
             editor.setValue("<p>Hello <b>World</b></p>");
@@ -196,6 +208,215 @@ class VaadinCKEditorIntegrationTest {
             String sanitized = editor.getSanitizedHtml();
             assertTrue(sanitized.contains("Text"));
             assertFalse(sanitized.contains("<script>"));
+        }
+
+        @Test
+        @DisplayName("issue #85: ValueChangeListener should receive new value via getValue() on client change")
+        void testValueChangeListenerReceivesNewValueFromClient() {
+            // 回归测试 issue #85：客户端输入触发 setModelValue 时，
+            // 监听器内调用 event.getValue() 必须返回新内容而非旧内容。
+            AtomicReference<String> capturedValue = new AtomicReference<>();
+            editor.addValueChangeListener(event ->
+                capturedValue.set(event.getValue()));
+
+            // 模拟来自客户端的内容变更（@ClientCallable setEditorData 走的就是这条路径）
+            editor.setModelValue("<p>typed by user</p>", true);
+
+            // issue #85 的核心断言：监听器读到的必须是新内容，而非旧内容。
+            assertEquals("<p>typed by user</p>", capturedValue.get(),
+                "event.getValue() should return the new content, not the stale value");
+            // getValue() 在事件之外也应保持一致
+            assertEquals("<p>typed by user</p>", editor.getValue());
+        }
+
+        @Test
+        @DisplayName("issue #85: ValueChangeListener should receive new value via getValue() on setValue")
+        void testValueChangeListenerReceivesNewValueFromSetValue() {
+            // 服务端 setValue 路径同样必须保证监听器读到新值。
+            AtomicReference<String> capturedValue = new AtomicReference<>();
+            editor.addValueChangeListener(event -> capturedValue.set(event.getValue()));
+
+            editor.setValue("<p>set by server</p>");
+
+            assertEquals("<p>set by server</p>", capturedValue.get(),
+                "event.getValue() should return the new content on the setValue path");
+            assertEquals("<p>set by server</p>", editor.getValue());
+        }
+
+        @Test
+        @DisplayName("setModelValue should not fire event when value is unchanged")
+        void testSetModelValueNoEventOnUnchanged() {
+            editor.setValue("<p>same</p>");
+
+            AtomicInteger fireCount = new AtomicInteger(0);
+            editor.addValueChangeListener(event -> fireCount.incrementAndGet());
+
+            // 设置相同的值不应触发事件
+            editor.setModelValue("<p>same</p>", true);
+            assertEquals(0, fireCount.get(), "no event should fire when value is unchanged");
+
+            // 设置不同的值应触发一次事件
+            editor.setModelValue("<p>different</p>", true);
+            assertEquals(1, fireCount.get(), "exactly one event should fire on actual change");
+        }
+
+        @Test
+        @DisplayName("issue #85: setValue(null) listener value must match final getValue()")
+        void testSetValueNullListenerConsistency() {
+            // P1 边界（审查发现）：setValue(null) 时，事件内读到的值
+            // 必须与方法返回后 getValue() 保持一致，均为 ""，不得为 null。
+            editor.setValue("<p>existing</p>");
+
+            AtomicReference<String> capturedValue = new AtomicReference<>("SENTINEL");
+            editor.addValueChangeListener(event -> capturedValue.set(event.getValue()));
+
+            editor.setValue(null);
+
+            assertEquals("", capturedValue.get(),
+                "event.getValue() must be normalized to empty string, not null");
+            assertEquals("", editor.getValue(),
+                "getValue() must return empty string after setValue(null)");
+        }
+
+        @Test
+        @DisplayName("issue #85: consecutive client changes carry correct old/new values")
+        void testConsecutiveClientChangesOldNewValues() {
+            // 验证 oldValue/newValue 语义在连续变更下正确传递。
+            AtomicReference<String> lastOld = new AtomicReference<>();
+            AtomicReference<String> lastNew = new AtomicReference<>();
+            editor.addValueChangeListener(event -> {
+                lastOld.set(event.getOldValue());
+                lastNew.set(event.getValue());
+            });
+
+            editor.setModelValue("<p>first</p>", true);
+            assertEquals("<p>first</p>", lastNew.get());
+
+            editor.setModelValue("<p>second</p>", true);
+            // 第二次变更：旧值应为第一次的新值，新值应为第二次内容。
+            assertEquals("<p>first</p>", lastOld.get(),
+                "oldValue should carry the previous content on consecutive changes");
+            assertEquals("<p>second</p>", lastNew.get());
+            assertEquals("<p>second</p>", editor.getValue());
+        }
+
+        @Test
+        @DisplayName("rapid successive setValue calls keep the last value and listener stays consistent")
+        void testRapidSuccessiveSetValuePreservesLast() {
+            // 审查发现的测试盲区：快速连续 setValue 应保留最后一个值，
+            // 且监听器最终读到的值与 getValue() 一致。
+            AtomicReference<String> lastListenerValue = new AtomicReference<>();
+            editor.addValueChangeListener(event -> lastListenerValue.set(event.getValue()));
+
+            for (int i = 0; i < 50; i++) {
+                editor.setValue("<p>v" + i + "</p>");
+            }
+
+            assertEquals("<p>v49</p>", editor.getValue(), "last setValue wins");
+            assertEquals("<p>v49</p>", lastListenerValue.get(),
+                "listener's final value must equal getValue()");
+        }
+
+        @Test
+        @DisplayName("rapid identical setValue calls fire exactly one change event")
+        void testRapidIdenticalSetValueFiresOnce() {
+            // 连续设置相同值只应触发一次事件（首次 ""→值），其余被 equals 守卫拦截。
+            AtomicInteger fireCount = new AtomicInteger(0);
+            editor.addValueChangeListener(event -> fireCount.incrementAndGet());
+
+            for (int i = 0; i < 10; i++) {
+                editor.setValue("<p>same</p>");
+            }
+
+            assertEquals(1, fireCount.get(),
+                "only the first distinct value should fire; identical repeats are guarded");
+            assertEquals("<p>same</p>", editor.getValue());
+        }
+
+        @Test
+        @DisplayName("interleaved setValue (server) and setModelValue (client) keep last value consistent")
+        void testInterleavedServerClientChanges() {
+            // 混合服务端 setValue 与客户端 setModelValue，最终值与监听器读到的值必须一致。
+            AtomicReference<String> lastListenerValue = new AtomicReference<>();
+            editor.addValueChangeListener(event -> lastListenerValue.set(event.getValue()));
+
+            editor.setValue("<p>server-1</p>");
+            editor.setModelValue("<p>client-1</p>", true);
+            editor.setValue("<p>server-2</p>");
+            editor.setModelValue("<p>client-2</p>", true);
+
+            assertEquals("<p>client-2</p>", editor.getValue());
+            assertEquals("<p>client-2</p>", lastListenerValue.get(),
+                "listener's final value must match getValue() after interleaved changes");
+        }
+    }
+
+    // ==================== Autosave Tests ====================
+
+    @Nested
+    @DisplayName("Autosave Tests")
+    class AutosaveTests {
+
+        @Test
+        @DisplayName("autosave callback receives the saved data and fires a success event")
+        void autosaveCallbackReceivesDataAndFiresSuccess() {
+            AtomicReference<String> callbackData = new AtomicReference<>();
+            editor.setAutosaveCallback(callbackData::set);
+
+            AtomicReference<AutosaveEvent> firedEvent = new AtomicReference<>();
+            editor.addAutosaveListener(firedEvent::set);
+
+            editor.saveEditorDataInternal("<p>auto saved</p>");
+
+            // 回调收到正确数据
+            assertEquals("<p>auto saved</p>", callbackData.get());
+            // 触发一次成功的 AutosaveEvent，内容一致
+            assertNotNull(firedEvent.get());
+            assertTrue(firedEvent.get().isSuccess());
+            assertEquals("<p>auto saved</p>", firedEvent.get().getContent());
+            assertNull(firedEvent.get().getErrorMessage());
+        }
+
+        @Test
+        @DisplayName("autosave callback exception fires a failure event with a non-null message")
+        void autosaveCallbackExceptionFiresFailure() {
+            editor.setAutosaveCallback(data -> { throw new RuntimeException("disk full"); });
+
+            AtomicReference<AutosaveEvent> firedEvent = new AtomicReference<>();
+            editor.addAutosaveListener(firedEvent::set);
+
+            editor.saveEditorDataInternal("<p>x</p>");
+
+            assertNotNull(firedEvent.get());
+            assertFalse(firedEvent.get().isSuccess(), "exception in callback → failure event");
+            assertEquals("disk full", firedEvent.get().getErrorMessage());
+        }
+
+        @Test
+        @DisplayName("autosave exception with null message still yields a non-null error message")
+        void autosaveCallbackNullMessageExceptionGetsFallback() {
+            editor.setAutosaveCallback(data -> { throw new RuntimeException(); }); // message == null
+            AtomicReference<AutosaveEvent> firedEvent = new AtomicReference<>();
+            editor.addAutosaveListener(firedEvent::set);
+
+            editor.saveEditorDataInternal("<p>x</p>");
+
+            assertFalse(firedEvent.get().isSuccess());
+            assertNotNull(firedEvent.get().getErrorMessage());
+            assertFalse(firedEvent.get().getErrorMessage().isEmpty());
+        }
+
+        @Test
+        @DisplayName("autosave with no callback still fires a success event")
+        void autosaveNoCallbackStillFiresEvent() {
+            AtomicReference<AutosaveEvent> firedEvent = new AtomicReference<>();
+            editor.addAutosaveListener(firedEvent::set);
+
+            editor.saveEditorDataInternal("<p>no-callback</p>");
+
+            assertNotNull(firedEvent.get(), "AutosaveEvent should fire even without a callback");
+            assertTrue(firedEvent.get().isSuccess());
+            assertEquals("<p>no-callback</p>", firedEvent.get().getContent());
         }
     }
 

@@ -53,6 +53,7 @@ import {
     // Upload adapters
     Base64UploadAdapter,
     SimpleUploadAdapter,
+    CKFinder,
     // Tables
     Table,
     TableToolbar,
@@ -63,6 +64,9 @@ import {
     PlainTableOutput,
     // Media
     MediaEmbed,
+    AutoMediaEmbed,
+    MediaEmbedStyle,
+    MediaEmbedToolbar,
     HtmlEmbed,
     // Code
     CodeBlock,
@@ -207,6 +211,7 @@ export const PLUGIN_REGISTRY: Record<string, PluginConstructor> = {
     // Upload adapters
     'Base64UploadAdapter': Base64UploadAdapter,
     'SimpleUploadAdapter': SimpleUploadAdapter,
+    'CKFinder': CKFinder,
     // Tables
     'Table': Table,
     'TableToolbar': TableToolbar,
@@ -217,6 +222,9 @@ export const PLUGIN_REGISTRY: Record<string, PluginConstructor> = {
     'PlainTableOutput': PlainTableOutput,
     // Media
     'MediaEmbed': MediaEmbed,
+    'AutoMediaEmbed': AutoMediaEmbed,
+    'MediaEmbedStyle': MediaEmbedStyle,
+    'MediaEmbedToolbar': MediaEmbedToolbar,
     'HtmlEmbed': HtmlEmbed,
     // Code
     'CodeBlock': CodeBlock,
@@ -304,6 +312,9 @@ const PLUGINS_REQUIRING_CONFIG: readonly string[] = [
     'CloudServicesCore',
     'CloudServicesUploadAdapter',
     'EasyImage',
+    // CKFinder 需要 config.ckfinder.uploadUrl / 服务端 CKFinder，缺配置会报错，
+    // 故从"全选"中过滤；显式配置后通过 allowConfigRequiredPlugins 放行。
+    'CKFinder',
 ];
 
 /**
@@ -370,6 +381,26 @@ export function registerCKEditorPlugin(name: string, plugin: unknown): void {
 }
 
 /**
+ * Remove a custom plugin from the global registry.
+ *
+ * The registry is a process-global (window-level) map: custom plugins registered
+ * via {@link registerCKEditorPlugin} live for the page lifetime. Long-lived apps that
+ * register plugins dynamically can call this to release entries they no longer need
+ * (review: the registry previously had no cleanup path → entries accumulated).
+ *
+ * @param name - The plugin name previously passed to registerCKEditorPlugin
+ * @returns true if an entry was removed, false if no entry existed
+ */
+export function unregisterCKEditorPlugin(name: string): boolean {
+    const registry = getGlobalPluginRegistry();
+    if (Object.prototype.hasOwnProperty.call(registry, name)) {
+        delete registry[name];
+        return true;
+    }
+    return false;
+}
+
+/**
  * Filter result from plugin conflict detection.
  */
 export interface FilterResult {
@@ -384,9 +415,13 @@ export interface FilterResult {
  */
 export interface FilterOptions {
     /**
-     * When true, disables automatic plugin filtering.
-     * Plugins requiring special configuration and unavailable plugins will still be loaded,
-     * which may cause runtime errors if not properly configured.
+     * ⚠️ Note the inverted sense of this flag (kept for backward compatibility):
+     * `strictPluginLoading = true` actually means "load everything verbatim, do NOT
+     * filter". When true, conflicting plugins, plugins requiring special configuration,
+     * and unavailable plugins are all left in the list, which may cause runtime errors
+     * if not properly configured. The default (`false`) applies the safety filtering.
+     *
+     * In short: `false` = filtered/safe (default), `true` = unfiltered/raw.
      *
      * @default false
      */
@@ -395,6 +430,9 @@ export interface FilterOptions {
     /**
      * When true, skips filtering of plugins that require special configuration.
      * Use this when you have properly configured plugins like Minimap or Title.
+     *
+     * 受影响的完整插件清单见 `PLUGINS_REQUIRING_CONFIG` 常量；可用
+     * `PluginResolver.requiresConfiguration(name)` 以编程方式判断某插件是否需要配置。
      *
      * @default false
      */
@@ -559,7 +597,11 @@ export class PluginResolver {
             if (plugin) {
                 resolvedPlugins.push(plugin);
             } else {
-                this.logger.warn(`Plugin not found in registry: ${pluginConfig.name}`);
+                // review: 缺失的 standard plugin 此前只 warn，不进 loadErrors，
+                // 与 premium/custom 失败的报告方式不一致。统一记入 loadErrors。
+                const errorMsg = `Plugin not found in registry: ${pluginConfig.name}`;
+                this.logger.warn(errorMsg);
+                this.loadErrors.push(errorMsg);
             }
         }
 

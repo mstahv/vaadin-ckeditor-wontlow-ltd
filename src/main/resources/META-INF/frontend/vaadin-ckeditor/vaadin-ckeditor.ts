@@ -4,7 +4,7 @@
  * A modular CKEditor 5 integration for Vaadin using the official ckeditor5 npm package.
  * Plugins are loaded dynamically based on configuration from the Java backend.
  */
-import { LitElement, html, css, PropertyValues } from 'lit';
+import { LitElement, html, css, render, nothing, PropertyValues } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 // Import modular components
@@ -16,6 +16,20 @@ import {
     registerCKEditorPlugin,
     type PluginConfig,
 } from './plugin-resolver';
+import {
+    buildCreateConfig,
+    normalizeAIConfig48,
+    normalizeRootConfig,
+    stripInitialDataIfChannelSeeded,
+    type RootConfig,
+} from './editor-config-normalizer';
+import { shouldRefreshSourceView } from './source-editing-refresh';
+import { decideDataChange } from './data-change-decision';
+import { replaceObserver, disposeObserver } from './observer-lifecycle';
+import { shouldRecreateEditor } from './reconnect-decision';
+import { createRefcount } from './dark-theme-refcount';
+import { isAllowedCssUrl } from './css-url-validator';
+import { shouldLoadMediaEmbedResize, loadMediaEmbedResizePlugin } from './media-embed-resize';
 
 // 内置插件
 import CommentPermissionEnforcer from './comment-permission-enforcer';
@@ -47,6 +61,19 @@ const TOOLBAR_REPAINT_DELAY_MS = 10;
 const STICKY_PANEL_SETUP_DELAY_MS = 100;
 /** Timeout (ms) for requestIdleCallback during editor destruction */
 const DESTROY_IDLE_TIMEOUT_MS = 100;
+/**
+ * 销毁「孤儿」编辑器时的最长等待时间。
+ * 该场景下组件已从 DOM 断开，而 CKEditor 的 destroy() 在 detached 状态下可能永不 settle，
+ * 因此必须设上界，避免创建锁与补偿重建被永久阻塞。
+ */
+const ORPHAN_DESTROY_TIMEOUT_MS = 2000;
+/**
+ * 编辑器容器的 class。
+ * 与 render() 中 `<div id="${editorId}" class="...">` 保持一致——
+ * detachStaleEditorContainer() 重建容器时用它还原「干净」状态，
+ * 不能沿用旧节点的 className（那上面可能已被 CKEditor 注入运行时 class）。
+ */
+const EDITOR_CONTENT_CLASS = 'editor-content';
 /** Opacity value used to trigger container repaint without visible flicker */
 const REPAINT_OPACITY = '0.99';
 /** Maximum polling attempts for minimap iframe injection */
@@ -179,6 +206,7 @@ export class VaadinCKEditor extends LitElement {
     @property({ type: String }) language = 'en';
     @property({ type: String }) overrideCssUrl = '';
     @property({ type: Boolean }) isReadOnly = false;
+    @property({ type: Boolean }) isEnabled = true;
     @property({ type: Boolean }) autosave = false;
     @property({ type: Number }) autosaveWaitingTime = 2000;
     @property({ type: Boolean }) minimapEnabled = false;
@@ -279,7 +307,15 @@ export class VaadinCKEditor extends LitElement {
 
     // Creation state management - prevent concurrent creation
     private isCreating = false;
+    /**
+     * 本次创建是否以「孤儿」收场（创建期间组件断开，实例已就地销毁）。
+     * 由 executeEditorCreation 的 finally 在释放 isCreating 后消费，触发补偿重建。
+     */
+    private pendingOrphanRecreate = false;
     private createPromise: Promise<void> | null = null;
+
+    // CKEditor 48 root config built during buildConfig(), consumed by createEditorInstance()
+    private pendingRootConfig: RootConfig = {};
 
     // Listener cleanup functions (undo/redo/clipboard/collaboration)
     private listenerCleanups: Array<() => void> = [];
@@ -301,12 +337,15 @@ export class VaadinCKEditor extends LitElement {
 
     // AI sidebar collapse observer for cleanup
     private aiSidebarCollapseObserver?: MutationObserver;
+    private annotationSidebarObserver?: MutationObserver;
+    /** 注销标注侧栏 scroll 监听的回调；由 setupAnnotationSidebarSync 设置。 */
+    private annotationScrollSyncDispose?: () => void;
 
     // Server communication
     private $server?: VaadinServer;
 
     // Version info — keep in sync with VaadinCKEditor.java VERSION constant
-    private readonly version = '5.1.0';
+    private readonly version = '5.4.0';
 
     constructor() {
         super();
@@ -329,7 +368,12 @@ export class VaadinCKEditor extends LitElement {
         // Initialize theme system (auto-sync with Vaadin or use explicit setting)
         this.initializeThemeSystem();
 
-        this.createEditor();
+        // createEditor 内部虽已捕获创建过程中的错误，但它自身在进入 try 之前会
+        // await 上一次的 destroyPromise；若那个 promise 被 reject，这里不加 catch
+        // 就会变成 unhandled rejection。显式兜底以保证错误走既有日志路径。
+        void this.createEditor().catch((e) => {
+            logger.error(' createEditor() failed unexpectedly:', e);
+        });
     }
 
     /**
@@ -356,12 +400,23 @@ export class VaadinCKEditor extends LitElement {
         if (changedProperties.has('editorData') && this.editor) {
             const currentData = this.editor.getData();
             if (currentData !== this.editorData) {
-                this.editor.setData(this.editorData);
+                // 必须走 updateData 而不是直接 setData：
+                // (1) updateData 会递增 apiChangeDepth，使随之而来的 change:data 被
+                //     decideDataChange 判定为「API 触发」；直接 setData 则 depth 为 0，
+                //     服务端推来的内容会被当成用户输入回传给 $server.setEditorData
+                //     （issue #38 修复过的问题，会从这条属性路径重新出现）；
+                // (2) updateData 还会调用 refreshSourceViewIfActive()，避免源码视图
+                //     仍显示旧快照（issue #57）。
+                this.updateData(this.editorData);
             }
         }
 
         if (changedProperties.has('isReadOnly') && this.editor) {
             this.updateReadOnly();
+        }
+
+        if (changedProperties.has('isEnabled') && this.editor) {
+            this.updateEnabled();
         }
 
         if (changedProperties.has('hideToolbar') && this.editor) {
@@ -541,18 +596,39 @@ export class VaadinCKEditor extends LitElement {
             logger.debug('CommentPermissionEnforcer plugin injected');
         }
 
+        // 嵌入媒体缩放（issue #71）：MediaEmbedResize 由 umbrella ckeditor5 导出，
+        // 但属功能性 premium（依赖的 editing 子插件 isPremiumPlugin=true），
+        // 故启用时才从 ckeditor5 按需动态加载，加载失败（如缺 license）静默降级。
+        if (shouldLoadMediaEmbedResize(this.config)) {
+            const resizePlugin = await loadMediaEmbedResizePlugin();
+            if (resizePlugin) {
+                resolvedPlugins.push(resizePlugin);
+                logger.debug('MediaEmbedResize plugin injected');
+            } else {
+                logger.warn('MediaEmbedResize requested but could not be loaded from ckeditor5 (a commercial license may be required)');
+            }
+        }
+
         // Get translations for the specified language
         const translations = this.language !== 'en' ? TRANSLATION_REGISTRY[this.language] : undefined;
 
         // 协作模式下检查频道是否已有数据，有则移除 initialData 避免警告
-        const configWithInitialData = await this.stripInitialDataIfChannelExists(this.config);
+        const configAfterChannel = await this.stripInitialDataIfChannelExists(this.config);
+
+        // CKEditor 48 配置规范化：兼容旧顶层 initialData/placeholder/label 与 AI v47 字段
+        const { config: configAfterAi, warnings: aiWarnings } = normalizeAIConfig48(configAfterChannel);
+        const { rootConfig, remainingConfig, warnings: rootWarnings } =
+            normalizeRootConfig(configAfterAi, this.editorType);
+
+        this.pendingRootConfig = rootConfig;
+        this.warnConfigMigration([...aiWarnings, ...rootWarnings]);
 
         let editorConfig: EditorConfig = {
             licenseKey: this.licenseKey,
             plugins: resolvedPlugins as EditorConfig['plugins'],
             language: this.language,
             ...(translations ? { translations: [translations] } : {}),
-            ...configWithInitialData,
+            ...remainingConfig,
         };
 
         // Add toolbar if specified (but don't override config.toolbar if it has shouldNotGroupWhenFull)
@@ -710,50 +786,19 @@ export class VaadinCKEditor extends LitElement {
     }
 
     /**
-     * 协作模式下检查频道是否已被初始化
-     *
-     * 当 config 同时包含 cloudServices（协作模式）和 initialData 时，
-     * 通过 localStorage 记录已初始化的频道。首次加载时保留 initialData
-     * 用于种子数据；后续加载检测到已初始化则移除 initialData，
-     * 避免 "editor-initial-data-replaced-with-revision-data" 警告。
-     *
-     * localStorage key 格式: ck-channel-seeded:{channelId}
-     *
-     * @param config 原始编辑器配置
-     * @returns 处理后的配置（可能移除了 initialData）
+     * 协作模式下检查频道是否已被初始化，逻辑委托给纯函数以便单测覆盖。
      */
     private async stripInitialDataIfChannelExists(
         config: Record<string, unknown>
     ): Promise<Record<string, unknown>> {
-        // 仅在协作模式（有 cloudServices 配置）且设置了 initialData 时检查
-        const cloudServices = config.cloudServices as Record<string, unknown> | undefined;
-        const collaboration = config.collaboration as Record<string, unknown> | undefined;
-        const hasInitialData = 'initialData' in config && config.initialData != null;
-
-        if (!cloudServices?.tokenUrl || !collaboration?.channelId || !hasInitialData) {
-            return config;
-        }
-
-        const channelId = collaboration.channelId as string;
-        const storageKey = `ck-channel-seeded:${channelId}`;
-
-        try {
-            if (localStorage.getItem(storageKey)) {
-                // 频道已被初始化过，移除 initialData 让 Cloud Services 加载已有数据
-                logger.info(`频道 "${channelId}" 已初始化，移除 initialData 避免冲突`);
-                const { initialData: _, ...configWithoutInitialData } = config;
-                return configWithoutInitialData;
-            }
-
-            // 首次加载：标记频道为已初始化，保留 initialData 用于种子
-            localStorage.setItem(storageKey, String(Date.now()));
-            logger.info(`频道 "${channelId}" 首次初始化，使用 initialData 种子数据`);
-        } catch {
-            // localStorage 不可用（隐私模式等），保留 initialData 让 CKEditor 自行处理
-            logger.warn('localStorage 不可用，保留 initialData');
-        }
-
-        return config;
+        const result = stripInitialDataIfChannelSeeded(config, {
+            storage: localStorage,
+            now: () => Date.now(),
+            onSeeded: (channelId) => logger.info(`频道 "${channelId}" 首次初始化，使用 initialData 种子数据`),
+            onAlreadySeeded: (channelId) => logger.info(`频道 "${channelId}" 已初始化，移除 initialData 避免冲突`),
+            onStorageUnavailable: () => logger.warn('localStorage 不可用，保留 initialData'),
+        });
+        return result.config;
     }
 
     /**
@@ -767,23 +812,39 @@ export class VaadinCKEditor extends LitElement {
             return;
         }
 
-        // Wait for any existing editor cleanup
-        await this.waitForPreviousEditorCleanup();
-
-        // Acquire creation lock
+        // 先占锁，再等待上一轮清理。
+        // 顺序很重要：JS 虽是单线程，但 await 会让出执行权——若先 await 再占锁，
+        // 两个并发调用者（如 connectedCallback 与 finally 的补偿重建）可能都通过了
+        // canCreateEditor() 的检查并停在同一个 await 上，恢复后各自占锁、各建一个编辑器。
+        // 把「检查-占锁」放在同一个同步区间内即可消除该窗口。
         this.isCreating = true;
 
-        // Validate editor element exists
-        const editorElement = this.querySelector(`[id="${CSS.escape(this.editorId)}"]`) as HTMLElement;
-        if (!editorElement) {
-            logger.error(`Editor element not found: #${this.editorId}`);
-            this.isCreating = false;
-            return;
-        }
+        // 占锁之后的每一条出口都必须释放锁，否则组件会永久卡在「创建中」而无法重试
+        // ——尤其 waitForPreviousEditorCleanup() 内部 await 的 destroyPromise 是可能
+        // reject 的（destroy 失败），若不兜底，异常会带着锁一起抛出去。
+        let handedOffToExecution = false;
+        try {
+            // Wait for any existing editor cleanup
+            await this.waitForPreviousEditorCleanup();
 
-        // Execute the creation process
-        this.createPromise = this.executeEditorCreation(editorElement);
-        await this.createPromise;
+            // Validate editor element exists
+            const editorElement = this.querySelector(`[id="${CSS.escape(this.editorId)}"]`) as HTMLElement;
+            if (!editorElement) {
+                logger.error(`Editor element not found: #${this.editorId}`);
+                return;
+            }
+
+            // Execute the creation process.
+            // executeEditorCreation 自带 finally 负责释放锁，故此处移交所有权，
+            // 不再由本函数的 finally 重复释放（否则会提前解锁）。
+            handedOffToExecution = true;
+            this.createPromise = this.executeEditorCreation(editorElement);
+            await this.createPromise;
+        } finally {
+            if (!handedOffToExecution) {
+                this.isCreating = false;
+            }
+        }
     }
 
     /**
@@ -797,8 +858,11 @@ export class VaadinCKEditor extends LitElement {
             return false;
         }
 
-        // Prevent concurrent creation - if already creating, wait for the existing creation to finish
-        if (this.isCreating && this.createPromise) {
+        // Prevent concurrent creation - if already creating, wait for the existing creation to finish.
+        // 只判断 isCreating，不再要求 createPromise 同时非空：
+        // createPromise 直到 await 之后才被赋值，而 isCreating 在进入 await 前就已占上；
+        // 若仍要求两者同时成立，第二个并发调用者会在这段窗口内被放行，创建出第二个编辑器。
+        if (this.isCreating) {
             logger.debug(' Editor creation already in progress, waiting...');
             return false;
         }
@@ -810,12 +874,82 @@ export class VaadinCKEditor extends LitElement {
      * Wait for any existing editor to be destroyed before creating a new one.
      */
     private async waitForPreviousEditorCleanup(): Promise<void> {
-        if (this.editor || this.isDestroying) {
-            logger.debug(' Waiting for previous editor cleanup...');
-            if (this.destroyPromise) {
-                await this.destroyPromise;
-            }
+        // 只要存在未完成的销毁就必须等待，不能再以 (editor || isDestroying) 为前置条件。
+        // 孤儿销毁场景下 editor 已为 null、isDestroying 也为 false（那条路径不走
+        // destroyEditor），但后台仍有一个 destroy() 在跑，且它结束时会向 source element
+        // 写回内容——而重连复用的正是同一个 DOM 节点（editorId 是 @property，不变）。
+        // 若不等它就创建新实例，迟到的销毁会把新编辑器的 DOM 清空。
+        // 直接以 destroyPromise 是否存在为准，可同时覆盖常规销毁与孤儿销毁两条路径。
+        if (!this.destroyPromise) {
+            return;
         }
+        logger.debug(' Waiting for previous editor cleanup...');
+
+        // 等待必须有上界。
+        // detached 状态下 CKEditor 的 destroy() 可能永不 settle（destroyEditor 中已有
+        // 该结论，孤儿路径正因此加了超时）。若这里再无界 await 同一个 promise，
+        // 挂起只是从「孤儿销毁」搬到了「补偿创建」：isCreating 被永久占用，
+        // 重连后依旧空白——等于把第 4 轮修掉的问题换个入口重新引入。
+        const timedOut = Symbol('cleanup-timeout');
+        const result = await Promise.race([
+            this.destroyPromise.then(() => undefined),
+            new Promise<typeof timedOut>((resolve) =>
+                setTimeout(() => resolve(timedOut), ORPHAN_DESTROY_TIMEOUT_MS)),
+        ]);
+
+        if (result === timedOut) {
+            // 放弃等待，但必须先切断旧实例对 DOM 的所有权：
+            // 迟到的 destroy() 会向 source element 写回，而新实例复用同一节点。
+            // 这里把容器整个换成一个全新的空节点，旧销毁即便稍后完成，
+            // 触碰到的也只是已被摘下的游离节点，不会影响新编辑器。
+            logger.debug(' Previous cleanup timed out - detaching stale container to protect the new editor');
+            this.detachStaleEditorContainer();
+        }
+    }
+
+    /**
+     * 用一个同 id 的全新空容器替换当前编辑器容器，切断旧编辑器实例对该 DOM 的所有权。
+     *
+     * <p>仅在「上一次销毁超时、但仍可能在后台完成」时调用：旧实例持有的是被替换下来的
+     * 那个游离节点，其迟到的写回不会再影响页面上的新编辑器。</p>
+     */
+    private detachStaleEditorContainer(): void {
+        const stale = this.querySelector(`[id="${CSS.escape(this.editorId)}"]`) as HTMLElement | null;
+        if (!stale || !stale.parentNode) {
+            return;
+        }
+
+        // 必须替换**容器节点对象本身**，只清空子节点是不够的：
+        // CKEditor 的 ElementApiMixin.updateSourceElement() 在销毁末尾执行
+        // setDataInElement(this.sourceElement, ...)，而后者是 `el.innerHTML = data`
+        // （见 @ckeditor/ckeditor5-utils）。这里的 sourceElement 正是我们传给
+        // Editor.create() 的这个容器。若沿用同一个对象，迟到的销毁会直接把
+        // 新编辑器的内容整片抹掉。
+        //
+        // 换成一个同 id、同 class 的新节点后，陈旧实例持有的是被摘下的游离节点，
+        // 它的 innerHTML 写回不再影响页面。
+        const fresh = document.createElement(stale.tagName.toLowerCase());
+        fresh.id = this.editorId;
+        // 用模板声明的固定 class，而不是 stale.className——后者可能已被 CKEditor
+        // 注入运行时 class（如 ck / ck-editor__editable 等），继承过来会污染新实例。
+        fresh.className = EDITOR_CONTENT_CLASS;
+        stale.parentNode.replaceChild(fresh, stale);
+
+        // 让 Lit 重新接管。
+        //
+        // 仅调用 requestUpdate() 是不够的：Lit 3 的模板实例在首次克隆时就绑定了
+        // AttributePart，不会因为一次重渲染而重新扫描被外部 replaceChild 掉的节点。
+        // 实测（jsdom + 本仓 lit 版本）：此后把 editorId 改成新值，Lit 会把它写到
+        // **已游离的旧节点**上，页面上的新节点仍保留旧 id —— 因为 setId() 是公开 API，
+        // editorId 确实可能在运行期变化，这条路径是可达的。
+        //
+        // 先把 renderRoot 渲染成 nothing，丢弃旧模板实例，再触发一次更新重新建立
+        // part 绑定；实测这样后续动态更新会正确落到页面上的节点。
+        const root = this.renderRoot as HTMLElement | undefined;
+        if (root) {
+            render(nothing, root);
+        }
+        this.requestUpdate();
     }
 
     /**
@@ -846,6 +980,16 @@ export class VaadinCKEditor extends LitElement {
         } finally {
             // Release creation lock - ensures execution regardless of success or failure
             this.isCreating = false;
+
+            // 若本次创建以「孤儿」收场（创建过程中组件被移出 DOM，刚建好的实例已就地销毁），
+            // 在此处补一次重建判定：此时 isCreating 刚刚复位，守卫才可能放行。
+            // 覆盖的场景是「创建中断开、且在创建结束前又重新连上」——那时
+            // connectedCallback 早已执行过（当时 isCreating 为 true 被守卫拦下），
+            // 若不在这里补触发，就再没有人会创建编辑器，组件永久空白。
+            if (this.pendingOrphanRecreate) {
+                this.pendingOrphanRecreate = false;
+                this.recreateEditorOnReconnect();
+            }
         }
     }
 
@@ -872,16 +1016,127 @@ export class VaadinCKEditor extends LitElement {
         logger.info(`Starting editor creation with ${this.plugins.length} plugins...`);
         const startTime = performance.now();
 
-        this.editor = await EditorConstructor.create(editorElement, config);
+        const createConfig = this.buildEditorCreateConfig(editorElement, config);
+        const created = await (EditorConstructor as unknown as {
+            create: (cfg: Record<string, unknown>) => Promise<Editor>;
+        }).create(createConfig);
+
+        // create() 是重操作（插件多时可达数秒），期间组件可能已被移出 DOM。
+        // 若此时仍无条件赋值给 this.editor，就会留下一个「孤儿编辑器」：
+        // disconnectedCallback 早已执行过，它调用 destroyEditor 时 this.editor 还是 null
+        // 而直接返回，之后再没有任何人来销毁它——DOM 子树、CKEditor 监听器与全局注册表
+        // 全部滞留，每次路由往返泄漏一个完整编辑器实例。
+        // 这里立即销毁刚建好的实例，并且不赋值给 this.editor。
+        if (this.isDisconnected) {
+            logger.debug(' Component disconnected during editor creation - destroying orphan instance');
+            try {
+                // 必须加超时：本分支恰好处于「组件已从 DOM 断开」的状态，而 destroyEditor()
+                // 中已有明确结论——detached 时 CKEditor 的 destroy() 可能永不 settle。
+                // 若在此无界 await，外层 executeEditorCreation 的 finally 就永远到不了，
+                // isCreating 会永久为 true，组件此后再也无法创建编辑器。
+                // 超时后放弃等待（实例交给 GC），继续走解锁与补偿重建流程。
+                // 给 destroy() 挂上自己的 catch：它可能迟到 reject，
+                // 而下方超时胜出后已无人 await 它，会变成 unhandled rejection。
+                const destroyed: Promise<void> = created.destroy().then(
+                    () => undefined,
+                    (e: unknown) => {
+                        logger.debug(' Orphan editor destroy rejected (ignored):', e);
+                    }
+                );
+
+                // 记录这次销毁，**不能只是不等它**。
+                // 关键：Promise.race 只停止等待，并不取消底层 destroy()；而 editorId 是
+                // @property，重连后复用的是同一个 DOM 节点。CKEditor 的
+                // Balloon/Inline/Decoupled 在 destroy() 末尾会向 source element 写回内容，
+                // 若放任迟到的销毁与新实例并发，它会把刚建好的编辑器 DOM 清空。
+                // 因此这里把销毁 promise 存起来，由后续创建流程的
+                // waitForPreviousEditorCleanup() 等待它，实现「同一节点同一时刻只有一个所有者」。
+                this.destroyPromise = destroyed;
+                void destroyed.finally(() => {
+                    if (this.destroyPromise === destroyed) {
+                        this.destroyPromise = null;
+                    }
+                });
+
+                // 超时只用于「不阻塞解锁」，销毁本身仍在后台推进并被上面登记。
+                await Promise.race([
+                    destroyed,
+                    new Promise<void>((resolve) => setTimeout(resolve, ORPHAN_DESTROY_TIMEOUT_MS)),
+                ]);
+            } catch (e) {
+                logger.debug(' Orphan editor destroy failed (ignored):', e);
+            }
+            // 标记「本次创建以孤儿收场」，真正的补偿重建交由
+            // executeEditorCreation 的 finally 在释放 isCreating 之后执行。
+            //
+            // 不能在这里 queueMicrotask：实测该 microtask 会排在外层 async 函数的
+            // finally **之前**（内层 return 时外层还停在 await，finally 尚未执行），
+            // 届时守卫看到 isCreating 仍为 true 会直接返回，补偿失效。
+            this.pendingOrphanRecreate = true;
+            return 0;
+        }
+
+        this.editor = created;
 
         const endTime = performance.now();
         const initTimeMs = endTime - startTime;
         logger.info(`Editor created in ${initTimeMs.toFixed(0)}ms`);
 
-        // Set editor ID for reference
-        (this.editor as unknown as { id: string }).id = this.editorId;
+        // 此处**不得**给 editor 实例赋 .id（issue #122）。
+        // Editor 在构造期间就已被注册进它自己的私有 Context：
+        // Context#_addEditor -> Collection#add -> _getItemIdBeforeAdding()，
+        // 后者发现新实例没有 .id，于是自动生成 uid() **写到实例上**，并以该值
+        // 为键存入内部 _itemMap。此后再覆盖 .id，实例便与它在 _itemMap 中的键脱钩：
+        //   destroy() -> Context#_removeEditor() -> editors.has(editor)
+        //   -> _itemMap.has(被覆盖的 id) === false -> remove() 从不执行
+        // 编辑器因此永远留在 context.editors 里，而 _removeEditor 仍会走到
+        // `this._contextOwner === editor` 分支调用 Context#destroy()，后者遍历
+        // 仍含该编辑器的 editors 再次调用 destroy() —— 形成无限递归，占满主线程并卡死标签页。
+        // 若将来确实需要在实例侧标识编辑器，请使用 WeakMap<Editor, string>，
+        // 不要在 CKEditor 拥有的对象上挂属性（Collection 的 idProperty 可自定义，
+        // 换个属性名同样可能撞上这一类问题）。
 
         return initTimeMs;
+    }
+
+    /**
+     * 构造 CKEditor 48 单参数 create 配置（委托纯函数实现，便于单测覆盖）。
+     */
+    private buildEditorCreateConfig(
+        editorElement: HTMLElement,
+        config: EditorConfig
+    ): Record<string, unknown> {
+        return buildCreateConfig(
+            editorElement,
+            config as unknown as Record<string, unknown>,
+            this.pendingRootConfig,
+            this.editorType
+        );
+    }
+
+    /**
+     * 注销标注侧栏的 scroll 监听（幂等）。
+     * 供重复 setup 前的清理与 disconnectedCallback 共用。
+     */
+    private disposeAnnotationScrollSync(): void {
+        if (this.annotationScrollSyncDispose) {
+            this.annotationScrollSyncDispose();
+            this.annotationScrollSyncDispose = undefined;
+        }
+    }
+
+    /**
+     * 在开发模式下打印 v47 → v48 配置迁移警告。
+     * 通过 window.VAADIN_CKEDITOR_DEBUG（与现有 DEBUG 标志一致）控制是否输出，避免生产环境噪音。
+     */
+    private warnConfigMigration(warnings: string[]): void {
+        if (warnings.length === 0 || !DEBUG) {
+            return;
+        }
+
+        for (const warning of warnings) {
+            logger.warn(`[CKEditor 48 migration] ${warning}`);
+        }
     }
 
     /**
@@ -898,6 +1153,9 @@ export class VaadinCKEditor extends LitElement {
 
         // Set read-only state
         this.updateReadOnly();
+
+        // Set enabled state (issue #46)
+        this.updateEnabled();
 
         // Set toolbar visibility
         this.updateToolbarVisibility();
@@ -1112,16 +1370,30 @@ export class VaadinCKEditor extends LitElement {
             }
         };
 
+        // 先移除上一次 setup 注册的 scroll 监听再重新注册。
+        // setupAnnotationSidebarSync 会在每次 onEditorReady 时执行，若只加不减：
+        // (1) 同一 wrapper 上会叠加 N 个监听器，一次滚动触发 N 次 syncPositions，
+        //     长评论列表下明显卡顿；
+        // (2) syncPositions 闭包持有 wrapper/sidebar/editable 与组件自身，
+        //     组件断开后这些监听器仍绑在游离节点上，造成泄漏。
+        // 相邻的 MutationObserver 已用 replaceObserver 处理了同样的问题，此处补齐。
+        this.disposeAnnotationScrollSync();
         wrapper.addEventListener('scroll', syncPositions);
         editable.addEventListener('scroll', syncPositions);
+        this.annotationScrollSyncDispose = () => {
+            wrapper.removeEventListener('scroll', syncPositions);
+            editable.removeEventListener('scroll', syncPositions);
+        };
         syncPositions();
 
-        // MutationObserver 监听侧栏变化（新增/删除评论），自动重新对齐
-        new MutationObserver(syncPositions).observe(sidebar, {
-            childList: true,
-            subtree: true,
-            attributes: true
-        });
+        // MutationObserver 监听侧栏变化（新增/删除评论），自动重新对齐。
+        // 用 replaceObserver 存为字段并在 disconnectedCallback 中断开，避免组件断开后泄漏、
+        // 重复 setup 时叠加（review 发现）。
+        this.annotationSidebarObserver = replaceObserver(
+            this.annotationSidebarObserver,
+            () => new MutationObserver(syncPositions),
+            (o) => o.observe(sidebar, { childList: true, subtree: true, attributes: true }),
+        );
     }
 
     /**
@@ -1230,20 +1502,31 @@ export class VaadinCKEditor extends LitElement {
         // Handle data changes
         this.dataChangeListener = () => {
             const activeEditor = this.editor;
-            if (!activeEditor) return;
+            if (!activeEditor || !this.$server) return;
             const newContent = activeEditor.getData();
 
-            // Fire content change event if content actually changed
-            if (this.$server && newContent !== this.lastKnownContent) {
-                // Use tracked change source, defaulting to USER_INPUT
-                const source = this.apiChangeDepth > 0 ? 'API' : this.changeSource;
-                this.$server.fireContentChange(this.lastKnownContent, newContent, source);
-                this.lastKnownContent = newContent;
-                // Reset change source after firing event
-                this.changeSource = 'USER_INPUT';
+            const decision = decideDataChange({
+                newContent,
+                lastKnownContent: this.lastKnownContent,
+                sync: this.sync,
+                apiChangeDepth: this.apiChangeDepth,
+                changeSource: this.changeSource,
+            });
+
+            if (decision.fireContentChange) {
+                this.$server.fireContentChange(this.lastKnownContent, newContent, decision.contentChangeSource);
+                if (decision.nextLastKnownContent !== null) {
+                    this.lastKnownContent = decision.nextLastKnownContent;
+                }
+                if (decision.resetChangeSource) {
+                    this.changeSource = 'USER_INPUT';
+                }
             }
 
-            if (this.sync && this.$server) {
+            // issue #38: 服务端回填（apiChangeDepth>0）不回写服务端，
+            // 否则 Binder.readBean() 会触发 fromClient=true 的 ValueChangeEvent，
+            // 使 Binder.hasChanges() 在无用户改动时误为 true。
+            if (decision.syncToServer) {
                 this.$server.setEditorData(newContent);
             }
         };
@@ -1361,7 +1644,18 @@ export class VaadinCKEditor extends LitElement {
 
             if (fileRepository) {
                 // Set up custom upload adapter factory
+                const originalFactory = fileRepository.createUploadAdapter;
                 fileRepository.createUploadAdapter = this.getUploadAdapterFactory();
+
+                // 该工厂闭包捕获了 this（Lit 元素），若不还原就会形成
+                // FileRepository 插件 -> 闭包 -> 组件 -> 整棵 DOM 子树 的引用链。
+                // destroyEditor() 在组件已断开时会跳过 editor.destroy()（交给 GC），
+                // 此时 CKEditor 自身不拆卸插件，这条链会把整个编辑器钉住，
+                // 每次路由往返泄漏一个实例。登记到 listenerCleanups——
+                // 它在 destroyEditor() 的 isDisconnected 提前 return **之前**无条件执行。
+                this.listenerCleanups.push(() => {
+                    fileRepository.createUploadAdapter = originalFactory;
+                });
                 logger.debug('Custom upload adapter configured for server-side file handling');
             }
         } catch {
@@ -1408,12 +1702,36 @@ export class VaadinCKEditor extends LitElement {
      * Update read-only state
      */
     private updateReadOnly(): void {
+        // 在宿主元素上反映只读状态，便于外部 CSS 通过 vaadin-ckeditor[readonly]
+        // 或 .readonly 选择器定制只读外观（issue #44）。即使 editor 尚未就绪也先反映。
+        this.toggleAttribute('readonly', this.isReadOnly);
+        this.classList.toggle('readonly', this.isReadOnly);
+
         if (!this.editor) return;
 
         if (this.isReadOnly) {
             this.editor.enableReadOnlyMode(this.editorId);
         } else {
             this.editor.disableReadOnlyMode(this.editorId);
+        }
+    }
+
+    /**
+     * 同步 enabled 状态（issue #46）。CKEditor 5 无独立的 disabled 概念，
+     * 用一个区别于 editorId 的只读锁实现 disable，避免与用户显式的 readOnly 互相覆盖；
+     * 同时在宿主元素上反映 disabled 属性/类，便于外部 CSS 定制。
+     */
+    private updateEnabled(): void {
+        this.toggleAttribute('disabled', !this.isEnabled);
+        this.classList.toggle('disabled', !this.isEnabled);
+
+        if (!this.editor) return;
+
+        const disabledLockId = `${this.editorId}--disabled`;
+        if (this.isEnabled) {
+            this.editor.disableReadOnlyMode(disabledLockId);
+        } else {
+            this.editor.enableReadOnlyMode(disabledLockId);
         }
     }
 
@@ -1520,9 +1838,8 @@ export class VaadinCKEditor extends LitElement {
     private loadCustomCss(): void {
         if (!this.overrideCssUrl) return;
 
-        // Validate URL: only allow http(s) and relative paths (case-insensitive check)
-        const normalizedUrl = this.overrideCssUrl.trim().toLowerCase();
-        if (normalizedUrl.includes('javascript:') || normalizedUrl.includes('data:')) {
+        // 白名单校验：只允许 http/https 绝对地址与相对路径（review: 子串黑名单可被绕过）
+        if (!isAllowedCssUrl(this.overrideCssUrl)) {
             logger.warn('Rejected overrideCssUrl with unsafe protocol:', this.overrideCssUrl);
             return;
         }
@@ -1557,6 +1874,9 @@ export class VaadinCKEditor extends LitElement {
             this.apiChangeDepth++;
             try {
                 this.editor.setData(value || '');
+                // issue #57: 源码视图下 setData 只更新 model，<textarea> 仍是旧快照。
+                // 退出并重新进入源码视图，强制源码 textarea 从新 model 重新填充。
+                this.refreshSourceViewIfActive();
             } finally {
                 // Decrement after a microtask to ensure change event fires first
                 queueMicrotask(() => {
@@ -1564,6 +1884,28 @@ export class VaadinCKEditor extends LitElement {
                 });
             }
         }
+    }
+
+    /**
+     * 若编辑器当前处于 SourceEditing 源码视图，toggle off→on 以刷新源码 textarea（issue #57）。
+     */
+    private refreshSourceViewIfActive(): void {
+        const editor = this.editor;
+        if (!editor || !editor.plugins.has('SourceEditing')) {
+            return;
+        }
+        const sourceEditing = editor.plugins.get('SourceEditing') as unknown as {
+            isSourceEditingMode: boolean;
+        };
+        if (!shouldRefreshSourceView({
+            hasSourceEditingPlugin: true,
+            isSourceEditingMode: sourceEditing.isSourceEditingMode,
+        })) {
+            return;
+        }
+        // 退出再进入源码视图，使 textarea 从刚更新的 model 重新填充
+        sourceEditing.isSourceEditingMode = false;
+        sourceEditing.isSourceEditingMode = true;
     }
 
     /**
@@ -1578,11 +1920,56 @@ export class VaadinCKEditor extends LitElement {
      * Public API: Insert text at cursor position
      */
     public insertText(text: string): void {
-        if (this.editor && this.cursorPosition) {
-            this.editor.model.change(writer => {
-                this.editor!.model.insertContent(writer.createText(text), this.cursorPosition as Parameters<typeof this.editor.model.insertContent>[1]);
-            });
+        if (!this.editor) {
+            return;
         }
+        // cursorPosition 仅在 change:range 事件触发后才有值；编辑器为空或首次插入
+        // （光标在首字符前、尚未发生选区变化）时它仍为 null。回退到当前选区的首位置，
+        // 确保 insertText 在这些场景下也能工作（issue #69）。
+        const position = this.cursorPosition
+            ?? this.editor.model.document.selection.getFirstPosition();
+        if (!position) {
+            return;
+        }
+        this.editor.model.change(writer => {
+            this.editor!.model.insertContent(writer.createText(text), position as Parameters<typeof this.editor.model.insertContent>[1]);
+        });
+    }
+
+    /**
+     * Public API: 把光标（折叠选区）移到文档起始/末尾并聚焦（issue #52）。
+     * @param edge - 'start' 移到文首，'end' 移到文末
+     */
+    private moveCaretTo(edge: 'start' | 'end'): void {
+        if (!this.editor) {
+            return;
+        }
+        const editor = this.editor;
+        const root = editor.model.document.getRoot();
+        if (!root) {
+            return;
+        }
+        // createPositionAt 的 offset：文首用 0，文末用 'end'
+        const offset = edge === 'start' ? 0 : 'end';
+        editor.model.change(writer => {
+            writer.setSelection(writer.createPositionAt(root, offset));
+        });
+        editor.editing.view.focus();
+    }
+
+    /** Public API: 光标移到文首并聚焦 */
+    public setCaretToStart(): void {
+        this.moveCaretTo('start');
+    }
+
+    /** Public API: 光标移到文末并聚焦 */
+    public setCaretToEnd(): void {
+        this.moveCaretTo('end');
+    }
+
+    /** Public API: 聚焦编辑器可编辑区 */
+    public focusEditor(): void {
+        this.editor?.editing.view.focus();
     }
 
     /**
@@ -1648,34 +2035,27 @@ export class VaadinCKEditor extends LitElement {
                 this.cursorPosition = null;
 
                 // Step 2: Remove all event listeners BEFORE destroy
-                // Use try-catch for each to ensure all get attempted
-                try {
-                    if (this.selectionChangeListener) {
-                        editor.model.document.selection.off('change:range', this.selectionChangeListener);
-                    }
-                } catch (e) { /* ignore */ }
+                // 每个 off() 独立 try，确保任一失败不影响后续清理
+                const safeOff = (remove: () => void): void => {
+                    try { remove(); } catch { /* ignore */ }
+                };
 
-                try {
-                    if (this.dataChangeListener) {
-                        editor.model.document.off('change:data', this.dataChangeListener);
-                    }
-                } catch (e) { /* ignore */ }
-
-                try {
-                    if (this.focusChangeListener) {
-                        editor.editing.view.document.off('change:isFocused', this.focusChangeListener);
-                    }
-                } catch (e) { /* ignore */ }
-
-                try {
-                    if (this.readOnlyChangeListener) {
-                        editor.off('change:isReadOnly', this.readOnlyChangeListener);
-                    }
-                } catch (e) { /* ignore */ }
+                if (this.selectionChangeListener) {
+                    safeOff(() => editor.model.document.selection.off('change:range', this.selectionChangeListener!));
+                }
+                if (this.dataChangeListener) {
+                    safeOff(() => editor.model.document.off('change:data', this.dataChangeListener!));
+                }
+                if (this.focusChangeListener) {
+                    safeOff(() => editor.editing.view.document.off('change:isFocused', this.focusChangeListener!));
+                }
+                if (this.readOnlyChangeListener) {
+                    safeOff(() => editor.off('change:isReadOnly', this.readOnlyChangeListener!));
+                }
 
                 // Remove undo/redo/clipboard/collaboration listeners
                 for (const cleanup of this.listenerCleanups) {
-                    try { cleanup(); } catch { /* ignore */ }
+                    safeOff(cleanup);
                 }
                 this.listenerCleanups = [];
 
@@ -1742,8 +2122,17 @@ export class VaadinCKEditor extends LitElement {
 
         // Clean up destroyPromise after the async IIFE settles,
         // so callers who awaited the returned promise see it resolve correctly.
-        this.destroyPromise.finally(() => {
-            this.destroyPromise = null;
+        //
+        // 必须按身份比对后再清空：destroyPromise 现在也承载「孤儿销毁」的登记
+        // （见 createEditorInstance 中的 orphan 分支）。若在此无条件置 null，
+        // 当本次销毁 settle 时恰好已有一个更新的孤儿销毁登记在案，就会把它抹掉，
+        // 使 waitForPreviousEditorCleanup() 不再等待——重新打开「迟到的销毁
+        // 清空新编辑器 DOM」这个所有权漏洞。
+        const settled = this.destroyPromise;
+        void settled.finally(() => {
+            if (this.destroyPromise === settled) {
+                this.destroyPromise = null;
+            }
         });
 
         logger.debug(' destroyEditor() returning promise');
@@ -1781,7 +2170,7 @@ export class VaadinCKEditor extends LitElement {
                     <div class="editor-container__editor-wrapper">
                         <div class="editor-container__sidebar" id="editor-outline" role="navigation" aria-label="Document Outline" ?hidden="${!this.documentOutlineEnabled}"></div>
                         <div class="editor-container__editor">
-                            <div id="${this.editorId}" class="editor-content"></div>
+                            <div id="${this.editorId}" class="${EDITOR_CONTENT_CLASS}"></div>
                         </div>
                         <div class="editor-container__sidebar editor-container__sidebar_ckeditor-ai" id="ai-sidebar-container" role="complementary" aria-label="AI Assistant" ?hidden="${!this.aiSidebarEnabled}"></div>
                         <div class="minimap-container" role="region" aria-label="Document Minimap" ?hidden="${!this.minimapEnabled}"></div>
@@ -1812,7 +2201,7 @@ export class VaadinCKEditor extends LitElement {
                      style="${heightStyle}">
                     <div class="editor-container__editor-wrapper">
                         <div class="editor-container__editor">
-                            <div id="${this.editorId}" class="editor-content"></div>
+                            <div id="${this.editorId}" class="${EDITOR_CONTENT_CLASS}"></div>
                         </div>
                         <div class="annotation-sidebar-wrapper" role="complementary" aria-label="Comments and Annotations">
                             <div class="presence-list-container" id="presence-list-container"></div>
@@ -1831,7 +2220,7 @@ export class VaadinCKEditor extends LitElement {
 
         return html`
             <div class="editor-container">
-                <div id="${this.editorId}" class="editor-content"></div>
+                <div id="${this.editorId}" class="${EDITOR_CONTENT_CLASS}"></div>
             </div>
         `;
     }
@@ -1844,21 +2233,61 @@ export class VaadinCKEditor extends LitElement {
         logger.debug(' connectedCallback, editorId:', this.editorId);
         this.isDisconnected = false;
 
-        // Suppress CKEditor Pagination plugin internal errors (non-fatal)
-        if (!this.paginationErrorHandler) {
-            this.paginationErrorHandler = (event: PromiseRejectionEvent) => {
-                const err = event.reason;
-                if (err instanceof TypeError &&
-                    err.stack?.includes('PageStarterInfoToPageBreakInfo')) {
-                    event.preventDefault();
-                    logger.debug('Suppressed Pagination plugin internal error:', err.message);
-                }
-            };
-            window.addEventListener('unhandledrejection', this.paginationErrorHandler);
-        }
+        // Suppress CKEditor Pagination plugin internal errors (non-fatal).
+        // review: 单个全局 unhandledrejection listener 跨所有实例共享（带引用计数），
+        // 避免每个编辑器各注册一个、同一个 rejection 触发 N 次冗余回调。
+        VaadinCKEditor.acquirePaginationErrorHandler();
+        this.paginationHandlerAcquired = true;
 
         // Setup scroll handler for sticky panel (must be called on each connection)
         this.setupStickyPanelObserver();
+
+        // 重挂载时重建编辑器与主题系统。
+        //
+        // 背景：编辑器原先只在 firstUpdated() 中创建，而 Lit 对同一个元素实例
+        // 只会调用一次 firstUpdated。disconnectedCallback 会销毁编辑器并把
+        // this.editor 置空，于是「移出 DOM 再放回」之后就永远不会再创建——
+        // 用户看到一个空白容器。Vaadin 中这类场景很常见：Div.remove() 后再 add()、
+        // 在布局间移动组件、@PreserveOnRefresh 视图、Tab/Accordion 切换等。
+        //
+        // 这里只处理「重挂载」：首次连接时 hasUpdated 为 false，创建仍交给
+        // firstUpdated（此时 shadow DOM 尚未渲染，容器元素还不存在）。
+        // 条件同时排除正在创建/销毁的中间态，避免与 firstUpdated 或未完成的
+        // 销毁流程重复触发。
+        this.recreateEditorOnReconnect();
+    }
+
+    /**
+     * 重挂载后按需重建编辑器与主题系统（幂等）。
+     *
+     * <p>两个调用点共用同一套守卫：
+     * <ul>
+     *   <li>{@code connectedCallback} —— 处理「销毁已完成后再重新连上」的常规情况；</li>
+     *   <li>{@code disconnectedCallback} 的销毁 microtask 结束时 —— 处理「同一 tick 内
+     *       remove 再 add」：那时 connectedCallback 早于销毁执行，看到的 editor 还没被清空，
+     *       会跳过重建，必须在销毁真正完成后补一次。</li>
+     * </ul>
+     *
+     * <p>首次连接不在此处理：那时 {@code hasUpdated} 为 false，shadow DOM 尚未渲染、
+     * 容器元素还不存在，创建仍由 {@code firstUpdated} 负责。
+     */
+    private recreateEditorOnReconnect(): void {
+        // 判定逻辑抽成纯函数便于单测（见 reconnect-decision.ts）
+        if (!shouldRecreateEditor({
+            hasUpdated: this.hasUpdated,
+            hasEditor: !!this.editor,
+            isCreating: this.isCreating,
+            isDestroying: this.isDestroying,
+            isDisconnected: this.isDisconnected,
+            isConnected: this.isConnected,
+        })) {
+            return;
+        }
+        logger.debug(' recreating editor and theme system after reconnect');
+        this.initializeThemeSystem();
+        void this.createEditor().catch((e) => {
+            logger.error(' createEditor() failed during reconnect:', e);
+        });
     }
 
     /**
@@ -1867,6 +2296,14 @@ export class VaadinCKEditor extends LitElement {
      */
     private static isSafeCssValue(value: string): boolean {
         return !/[{};]/.test(value);
+    }
+
+    /**
+     * 转义值以安全嵌入双引号 CSS 属性选择器 [attr="..."] 中。
+     * 去除可越出引号上下文的字符：反斜杠、双引号、右方括号（review: editorId 与 buttonName 统一处理）。
+     */
+    private static cssAttrValueSafe(value: string): string {
+        return value.replace(/[\\"\]]/g, '');
     }
 
     /**
@@ -1882,9 +2319,8 @@ export class VaadinCKEditor extends LitElement {
         this.removeToolbarStyles();
 
         const style = this.toolbarStyle;
-        // Escape editorId for safe use in CSS attribute selector
-        const safeEditorId = this.editorId.replace(/[\\"]/g, '');
-        const scope = `vaadin-ckeditor[editor-id="${safeEditorId}"]`;
+        // 统一用 cssAttrValueSafe 转义，防止值越出双引号属性选择器 [attr="..."]（review: 与 buttonName 保持一致）
+        const scope = `vaadin-ckeditor[editor-id="${VaadinCKEditor.cssAttrValueSafe(this.editorId)}"]`;
         const rules: string[] = [];
 
         // Helper to safely add a CSS value (rejects values with injection characters)
@@ -1925,7 +2361,7 @@ export class VaadinCKEditor extends LitElement {
         if (style.buttonStyles) {
             for (const [buttonName, buttonStyle] of Object.entries(style.buttonStyles)) {
                 // Sanitize buttonName to prevent CSS injection via attribute selector
-                const safeName = buttonName.replace(/[\\"\]]/g, '');
+                const safeName = VaadinCKEditor.cssAttrValueSafe(buttonName);
                 if (!safeName) continue;
                 const btnSelector = `${scope} .ck.ck-toolbar .ck-button[data-cke-tooltip-text*="${safeName}"]`;
                 if (buttonStyle.background && safe(buttonStyle.background)) {
@@ -1977,7 +2413,34 @@ export class VaadinCKEditor extends LitElement {
     // CKEditor 5 Pagination plugin has an internal bug in _mapElementPageStarterInfoToPageBreakInfo
     // that throws "Cannot read properties of undefined (reading 'parent')" during page break
     // recalculation after dimension changes. This is non-fatal — the editor works correctly.
-    private paginationErrorHandler: ((event: PromiseRejectionEvent) => void) | null = null;
+    //
+    // review: 改为单个进程级共享 listener + 引用计数，避免每实例各注册一个导致冗余触发。
+    private paginationHandlerAcquired = false;
+    private static paginationRefcount = createRefcount();
+    private static paginationListener: ((event: PromiseRejectionEvent) => void) | null = null;
+
+    private static acquirePaginationErrorHandler(): void {
+        VaadinCKEditor.paginationRefcount = VaadinCKEditor.paginationRefcount.acquire();
+        if (VaadinCKEditor.paginationRefcount.justApplied) {
+            VaadinCKEditor.paginationListener = (event: PromiseRejectionEvent) => {
+                const err = event.reason;
+                if (err instanceof TypeError &&
+                    err.stack?.includes('PageStarterInfoToPageBreakInfo')) {
+                    event.preventDefault();
+                    logger.debug('Suppressed Pagination plugin internal error:', err.message);
+                }
+            };
+            window.addEventListener('unhandledrejection', VaadinCKEditor.paginationListener);
+        }
+    }
+
+    private static releasePaginationErrorHandler(): void {
+        VaadinCKEditor.paginationRefcount = VaadinCKEditor.paginationRefcount.release();
+        if (VaadinCKEditor.paginationRefcount.justRemoved && VaadinCKEditor.paginationListener) {
+            window.removeEventListener('unhandledrejection', VaadinCKEditor.paginationListener);
+            VaadinCKEditor.paginationListener = null;
+        }
+    }
 
     // Sticky panel scroll handler state
     private stickyPanelScrollHandler: (() => void) | null = null;
@@ -2110,10 +2573,10 @@ export class VaadinCKEditor extends LitElement {
         // Clean up theme manager (observers and dark theme)
         this.themeManager.cleanup();
 
-        // Clean up pagination error handler
-        if (this.paginationErrorHandler) {
-            window.removeEventListener('unhandledrejection', this.paginationErrorHandler);
-            this.paginationErrorHandler = null;
+        // Clean up pagination error handler (release shared global listener)
+        if (this.paginationHandlerAcquired) {
+            VaadinCKEditor.releasePaginationErrorHandler();
+            this.paginationHandlerAcquired = false;
         }
 
         // Clean up sticky panel observer
@@ -2124,6 +2587,10 @@ export class VaadinCKEditor extends LitElement {
             this.aiSidebarCollapseObserver.disconnect();
             this.aiSidebarCollapseObserver = undefined;
         }
+
+        // Clean up annotation sidebar observer (review: was never disconnected → leak)
+        this.annotationSidebarObserver = disposeObserver(this.annotationSidebarObserver);
+        this.disposeAnnotationScrollSync();
 
         // Clean up toolbar repaint timer
         if (this.toolbarRepaintTimeoutId) {
@@ -2165,7 +2632,19 @@ export class VaadinCKEditor extends LitElement {
         // and to let Vaadin complete its DOM operations first
         queueMicrotask(() => {
             logger.debug('disconnectedCallback microtask executing');
-            void this.destroyEditor();
+            void this.destroyEditor().then(() => {
+                // 销毁是延迟到 microtask 的，而「同一 tick 内 remove() 再 add()」
+                // （Vaadin 在布局间移动组件的常见模式）的实际回调顺序是：
+                //   disconnectedCallback → connectedCallback → 本 microtask
+                // 因此 connectedCallback 执行时 this.editor 尚未被清空，其重建守卫
+                // 会跳过创建；等本 microtask 跑完，编辑器已被销毁却无人重建，
+                // 组件就永久停在空白状态。
+                // 这里在销毁完成后补一次判断：若此刻组件其实已经重新连上，则重建。
+                if (!this.isDisconnected && this.isConnected) {
+                    logger.debug(' reconnected during destroy - recreating editor');
+                    this.recreateEditorOnReconnect();
+                }
+            });
         });
         logger.debug('disconnectedCallback END (microtask scheduled)');
     }

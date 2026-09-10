@@ -7,6 +7,7 @@
  * - OS dark mode detection
  * - Theme reference counting for multi-instance support
  */
+import { createRefcount } from './dark-theme-refcount';
 
 /**
  * Dark theme CSS variables for CKEditor
@@ -59,6 +60,18 @@ export const DARK_THEME_VARS: Record<string, string> = {
     '--ck-color-widget-editable-focus-background': 'hsl(270, 1%, 22%)',
     '--ck-color-link-default': 'hsl(190, 100%, 75%)',
     '--ck-color-editable-blur-selection': 'hsl(270, 1%, 35%)',
+
+    // CKEditor 48 AI 官方 token（暗色映射），与项目自定义 --ck-ai-bg-*/text-*/border-* 语义层互不冲突
+    '--ck-color-ai-chat-primary-button-background': 'hsl(208, 90%, 45%)',
+    '--ck-color-ai-chat-primary-button-hover-background': 'hsl(208, 90%, 40%)',
+    '--ck-color-ai-chat-primary-button-text': 'hsl(0, 0%, 100%)',
+    '--ck-color-ai-chat-input-background': 'hsl(255, 3%, 18%)',
+    '--ck-color-ai-chat-input-border': 'hsl(257, 3%, 43%)',
+    '--ck-color-ai-chat-border-main': 'hsl(257, 3%, 30%)',
+    '--ck-color-ai-header-icon': 'hsl(0, 0%, 88%)',
+    '--ck-color-ai-notification-error-background': 'hsl(355, 70%, 40%)',
+    '--ck-color-ai-suggestion-marker-insertion-background': 'hsla(140, 70%, 45%, 0.25)',
+    '--ck-color-ai-suggestion-marker-deletion-background': 'hsla(355, 70%, 45%, 0.25)',
 };
 
 /**
@@ -66,7 +79,7 @@ export const DARK_THEME_VARS: Record<string, string> = {
  * Tracks how many editor instances are using dark theme to ensure
  * CSS variables are only removed when the last dark theme instance is destroyed.
  */
-let darkThemeRefCount = 0;
+let darkThemeRefcount = createRefcount();
 
 /**
  * Dark theme style element ID
@@ -202,9 +215,9 @@ export class ThemeManager {
             return;
         }
         this.isDarkThemeActive = true;
-        darkThemeRefCount++;
+        darkThemeRefcount = darkThemeRefcount.acquire();
 
-        if (darkThemeRefCount === 1) {
+        if (darkThemeRefcount.justApplied) {
             const rootStyle = document.documentElement.style;
             Object.entries(DARK_THEME_VARS).forEach(([key, value]) => {
                 rootStyle.setProperty(key, value);
@@ -228,9 +241,9 @@ export class ThemeManager {
             return;
         }
         this.isDarkThemeActive = false;
-        darkThemeRefCount = Math.max(0, darkThemeRefCount - 1);
+        darkThemeRefcount = darkThemeRefcount.release();
 
-        if (darkThemeRefCount === 0) {
+        if (darkThemeRefcount.justRemoved) {
             const rootStyle = document.documentElement.style;
             Object.keys(DARK_THEME_VARS).forEach((key) => {
                 rootStyle.removeProperty(key);

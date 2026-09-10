@@ -313,4 +313,175 @@ class UploadManagerTest {
         assertDoesNotThrow(() ->
             manager.handleUpload("timeout-4", "test.jpg", "image/jpeg", createBase64Data("test")));
     }
+
+    // review: base64 应在 decode 前按长度估算大小拦截，避免超大上传 OOM
+    @Test
+    @DisplayName("handleUpload should reject oversized base64 BEFORE decoding (OOM guard)")
+    void handleUploadRejectsOversizedBeforeDecode() throws Exception {
+        UploadHandler.UploadConfig config = new UploadHandler.UploadConfig().setMaxFileSize(16);
+        // 这个 handler 一旦被调用就说明数据已被 decode —— 不应发生
+        AtomicReference<Boolean> handlerInvoked = new AtomicReference<>(false);
+        UploadHandler handler = (ctx, stream) -> {
+            handlerInvoked.set(true);
+            return CompletableFuture.completedFuture(new UploadHandler.UploadResult("url"));
+        };
+        manager = new UploadManager(handler, config, createCallback());
+
+        // 远超 16 字节上限的内容
+        String big = createBase64Data("x".repeat(10_000));
+        manager.handleUpload("oom-1", "big.bin", "image/jpeg", big);
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+        assertEquals("oom-1", lastUploadId.get());
+        assertNull(lastUrl.get());
+        assertNotNull(lastError.get());
+        assertTrue(lastError.get().toLowerCase().contains("size") || lastError.get().contains("exceeds"),
+            "error should mention size limit, got: " + lastError.get());
+        assertFalse(handlerInvoked.get(), "handler must not run — data should be rejected before decode");
+    }
+
+    @Test
+    @DisplayName("handleUpload should allow data within size limit")
+    void handleUploadAllowsWithinSizeLimit() throws Exception {
+        UploadHandler.UploadConfig config = new UploadHandler.UploadConfig().setMaxFileSize(1024);
+        manager = new UploadManager(createSuccessHandler("https://example.com/ok.jpg"), config, createCallback());
+
+        manager.handleUpload("ok-size", "ok.jpg", "image/jpeg", createBase64Data("small"));
+
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+        assertEquals("https://example.com/ok.jpg", lastUrl.get());
+        assertNull(lastError.get());
+    }
+
+    // review (Codex): 组件重挂载导致 uploadId 跨代复用时，不得被去重守卫误拦
+    @Test
+    @DisplayName("reused uploadId from a later generation must still notify")
+    void crossGenerationIdReuseIsNotBlocked() throws Exception {
+        // handleUpload 是 @ClientCallable，uploadId 由客户端提供、服务端不校验唯一性。
+        // 此前 notifiedUploadIds 只增不减，同一 ID 的后续上传会被误判为重复通知而
+        // 静默跳过——文件已存服务端、前端永远转圈。属服务端纵深防御。
+        java.util.List<String> notified = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        UploadHandler handler = (ctx, in) ->
+            CompletableFuture.completedFuture(new UploadHandler.UploadResult("/ok.jpg"));
+        manager = new UploadManager(handler, null, (id, url, err) -> notified.add(id));
+
+        manager.handleUpload("upload-e-1", "first.jpg", "image/jpeg", createBase64Data("a"));
+        waitUntil(() -> notified.size() == 1);
+
+        // 第二代复用同一 uploadId，必须同样得到回调
+        manager.handleUpload("upload-e-1", "second.jpg", "image/jpeg", createBase64Data("b"));
+        waitUntil(() -> notified.size() == 2);
+
+        assertEquals(2, notified.size(),
+            "复用的 uploadId 必须能再次回调，否则前端会永久等待");
+    }
+
+    @Test
+    @DisplayName("两代上传重叠时，先结束的一代不得删除另一代的登记")
+    void overlappingGenerationsDoNotEvictEachOther() throws Exception {
+        // review (Codex, 第二轮): 上一版测试只覆盖「第一代完全结束后再复用 ID」，
+        // 未覆盖两代同时在途。此时若按裸 uploadId 无条件 remove，
+        // 先结束的一代会把仍在途的另一代从 activeTasks 中删掉，
+        // 导致后者无法被取消、状态查询失效。
+        CompletableFuture<UploadHandler.UploadResult> gen1 = new CompletableFuture<>();
+        CompletableFuture<UploadHandler.UploadResult> gen2 = new CompletableFuture<>();
+        java.util.List<CompletableFuture<UploadHandler.UploadResult>> queue =
+            java.util.Collections.synchronizedList(
+                new java.util.ArrayList<>(java.util.List.of(gen1, gen2)));
+
+        manager = new UploadManager((ctx, in) -> queue.remove(0), null, (id, url, err) -> { });
+
+        manager.handleUpload("upload-x-1", "gen1.jpg", "image/jpeg", createBase64Data("a"));
+        waitUntil(() -> manager.getActiveUploadCount() == 1);
+
+        // 第二代复用同一 ID（组件重挂载后计数器归零），与第一代重叠
+        manager.handleUpload("upload-x-1", "gen2.jpg", "image/jpeg", createBase64Data("b"));
+
+        // 第一代先完成
+        gen1.complete(new UploadHandler.UploadResult("/gen1.jpg"));
+
+        // 第二代仍在途，其登记不得被第一代的退休流程删除
+        Thread.sleep(150);
+        assertNotNull(manager.getUploadTask("upload-x-1"),
+            "第一代结束后，仍在途的第二代登记必须保留");
+
+        gen2.complete(new UploadHandler.UploadResult("/gen2.jpg"));
+        waitUntil(() -> manager.getUploadTask("upload-x-1") == null);
+    }
+
+    /** 轮询等待条件成立，避免固定 sleep 带来的偶发失败。 */
+    private static void waitUntil(java.util.function.BooleanSupplier condition) throws Exception {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (!condition.getAsBoolean()) {
+            if (System.currentTimeMillis() > deadline) {
+                throw new AssertionError("等待条件超时（5s）");
+            }
+            Thread.sleep(5);
+        }
+    }
+
+    // review: double-notification 守卫此前在 task==null（early failure）时被绕过
+    @Test
+    @DisplayName("notifyResult must guard duplicates even on early-failure paths (no task)")
+    void earlyFailureNotifiesExactlyOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger callbackCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        UploadManager.UploadResultCallback countingCallback = (id, url, err) -> callbackCount.incrementAndGet();
+
+        // 无 handler → 走 early-failure 路径（task==null）
+        manager = new UploadManager(null, null, countingCallback);
+
+        // 同一 uploadId 触发两次 early failure
+        manager.handleUpload("dup-1", "a.jpg", "image/jpeg", createBase64Data("x"));
+        manager.handleUpload("dup-1", "a.jpg", "image/jpeg", createBase64Data("x"));
+
+        // 即使 task==null，uploadId 守卫也保证只回调一次
+        assertEquals(1, callbackCount.get(),
+            "same uploadId must notify exactly once even without an UploadTask");
+    }
+
+    // review (test-gap): 并发 cancel vs complete 必须只回调一次
+    @org.junit.jupiter.api.RepeatedTest(20)
+    @DisplayName("concurrent cancel and completion notify the callback exactly once")
+    void concurrentCancelAndCompleteNotifyOnce() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger callbackCount =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+        CountDownLatch done = new CountDownLatch(1);
+        UploadManager.UploadResultCallback countingCallback = (id, url, err) -> {
+            callbackCount.incrementAndGet();
+            done.countDown();
+        };
+
+        // handler 返回一个可被外部 race 完成的 future
+        CompletableFuture<UploadHandler.UploadResult> future = new CompletableFuture<>();
+        CountDownLatch handlerStarted = new CountDownLatch(1);
+        UploadHandler racingHandler = (ctx, stream) -> {
+            handlerStarted.countDown();
+            return future;
+        };
+
+        manager = new UploadManager(racingHandler, null, countingCallback);
+        manager.handleUpload("race-1", "r.jpg", "image/jpeg", createBase64Data("data"));
+        assertTrue(handlerStarted.await(2, TimeUnit.SECONDS));
+
+        // 同时从两个线程触发 complete 与 cancel，制造竞态
+        CountDownLatch go = new CountDownLatch(1);
+        Thread completer = new Thread(() -> {
+            try { go.await(); } catch (InterruptedException ignored) { }
+            future.complete(new UploadHandler.UploadResult("https://example.com/r.jpg"));
+        });
+        Thread canceller = new Thread(() -> {
+            try { go.await(); } catch (InterruptedException ignored) { }
+            manager.cancelUpload("race-1");
+        });
+        completer.start();
+        canceller.start();
+        go.countDown(); // 同时放行
+        completer.join(2000);
+        canceller.join(2000);
+
+        assertTrue(done.await(2, TimeUnit.SECONDS), "callback should fire");
+        // 关键断言：无论 cancel 还是 complete 先到，回调只能发生一次
+        assertEquals(1, callbackCount.get(),
+            "concurrent cancel/complete must notify exactly once, never twice");
+    }
 }

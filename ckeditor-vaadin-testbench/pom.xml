@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.wontlost</groupId>
+    <artifactId>ckeditor-vaadin-testbench</artifactId>
+    <packaging>jar</packaging>
+    <version>5.4.0</version>
+    <name>CKEditorVaadin TestBench</name>
+    <description>
+        Optional Vaadin TestBench element API for the CKEditor 5 Vaadin integration.
+        Provides VaadinCKEditorElement for type-safe interaction in end-to-end tests.
+        Vaadin TestBench is a commercial (Premium) feature: consumers must supply their
+        own TestBench dependency and license to run tests. This module only provides the
+        compile-time element wrapper and does not bundle TestBench at runtime.
+    </description>
+    <url>https://github.com/wontlost-ltd/vaadin-ckeditor</url>
+
+    <scm>
+        <url>https://github.com/wontlost-ltd/vaadin-ckeditor</url>
+        <connection>scm:git:https://github.com/wontlost-ltd/vaadin-ckeditor.git</connection>
+        <developerConnection>scm:git:git@github.com:wontlost-ltd/vaadin-ckeditor.git</developerConnection>
+    </scm>
+
+    <properties>
+        <vaadin.version>25.2.6</vaadin.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    </properties>
+
+    <organization>
+        <name>WontLost Ltd</name>
+    </organization>
+
+    <licenses>
+        <license>
+            <name>Apache 2</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <name>WontLost Ltd</name>
+            <email>service@wontlost.com</email>
+            <organization>WontLost Ltd</organization>
+            <organizationUrl>https://github.com/wontlost-ltd</organizationUrl>
+        </developer>
+    </developers>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- vaadin-bom 透传 vaadin-testbench-bom，统一管理 TestBench 各 artifact 版本 -->
+            <dependency>
+                <groupId>com.vaadin</groupId>
+                <artifactId>vaadin-bom</artifactId>
+                <type>pom</type>
+                <scope>import</scope>
+                <version>${vaadin.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!--
+            Vaadin TestBench core（Premium / 商业 license）。
+            scope=provided：仅编译期需要 TestBenchElement / @Element API；
+            运行测试的消费方自带 TestBench 依赖与 license，本模块不在 runtime 强加 TestBench。
+            版本由 vaadin-bom → vaadin-testbench-bom 管理，无需显式声明。
+        -->
+        <dependency>
+            <groupId>com.vaadin</groupId>
+            <artifactId>vaadin-testbench-core</artifactId>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <!--
+        release profile：与主模块一致，发布到 Maven Central（Sonatype Central Portal）。
+        激活方式：mvn -Prelease deploy。需要 CENTRAL_USERNAME/CENTRAL_PASSWORD 与 GPG 配置。
+        Maven Central 强制要求 source jar、javadoc jar 与 GPG 签名，故全部在此 profile 中附加。
+    -->
+    <profiles>
+        <profile>
+            <id>release</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.10.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>central</publishingServerId>
+                            <autoPublish>true</autoPublish>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-javadoc-plugin</artifactId>
+                        <version>3.10.1</version>
+                        <executions>
+                            <execution>
+                                <id>attach-javadocs</id>
+                                <goals>
+                                    <goal>jar</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                        <configuration>
+                            <quiet>true</quiet>
+                            <doclint>none</doclint>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-gpg-plugin</artifactId>
+                        <version>3.2.8</version>
+                        <executions>
+                            <execution>
+                                <id>sign-artifacts</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>sign</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>

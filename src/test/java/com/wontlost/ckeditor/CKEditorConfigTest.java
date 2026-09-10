@@ -141,6 +141,106 @@ class CKEditorConfigTest {
         assertThat(json.get("mediaEmbed").get("previewsInData").asBoolean()).isTrue();
     }
 
+    // issue #71: media embed drag-to-resize
+    @Test
+    @DisplayName("setMediaEmbedResizable should set the resizable flag")
+    void setMediaEmbedResizableShouldSetFlag() {
+        config.setMediaEmbedResizable(true);
+        ObjectNode json = config.toJson();
+
+        assertThat(json.get("mediaEmbed").get("resizable").asBoolean()).isTrue();
+        assertThat(config.isMediaEmbedResizable()).isTrue();
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedToolbar should write items to mediaEmbed.toolbar")
+    void setMediaEmbedToolbarShouldWriteItems() {
+        config.setMediaEmbedToolbar("mediaEmbed:alignLeft", "mediaEmbed:alignCenter", "mediaEmbed:alignRight");
+        ObjectNode json = config.toJson();
+
+        assertThat(json.get("mediaEmbed").has("toolbar")).isTrue();
+        assertThat(json.get("mediaEmbed").get("toolbar")).hasSize(3);
+        assertThat(json.get("mediaEmbed").get("toolbar").get(0).asString())
+            .isEqualTo("mediaEmbed:alignLeft");
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedToolbar should coexist with resizable on the same mediaEmbed object")
+    void setMediaEmbedToolbarShouldCoexistWithResizable() {
+        config.setMediaEmbedResizable(true)
+              .setMediaEmbedToolbar("mediaEmbed:alignCenter");
+        ObjectNode json = config.toJson();
+
+        assertThat(json.get("mediaEmbed").get("resizable").asBoolean()).isTrue();
+        assertThat(json.get("mediaEmbed").get("toolbar")).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedToolbar with empty/null does not write a toolbar field")
+    void setMediaEmbedToolbarEmptyShouldNotWriteField() {
+        config.setMediaEmbedToolbar();
+        ObjectNode json = config.toJson();
+        assertThat(json.has("mediaEmbed")).isFalse();
+
+        config.setMediaEmbedToolbar((String[]) null);
+        assertThat(config.toJson().has("mediaEmbed")).isFalse();
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedToolbar coexists with setMediaEmbed regardless of call order")
+    void setMediaEmbedToolbarCoexistsWithSetMediaEmbedEitherOrder() {
+        // toolbar 先、previewsInData 后
+        config.setMediaEmbedToolbar("mediaEmbed:alignCenter").setMediaEmbed(true);
+        ObjectNode json = config.toJson();
+        assertThat(json.get("mediaEmbed").get("previewsInData").asBoolean()).isTrue();
+        assertThat(json.get("mediaEmbed").get("toolbar")).hasSize(1);
+
+        // 反向顺序：previewsInData 先、toolbar 后
+        CKEditorConfig reversed = new CKEditorConfig();
+        reversed.setMediaEmbed(false).setMediaEmbedToolbar("mediaEmbed:alignLeft");
+        ObjectNode rjson = reversed.toJson();
+        assertThat(rjson.get("mediaEmbed").get("previewsInData").asBoolean()).isFalse();
+        assertThat(rjson.get("mediaEmbed").get("toolbar")).hasSize(1);
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedToolbar last non-empty call overwrites previous toolbar")
+    void setMediaEmbedToolbarLastCallWins() {
+        config.setMediaEmbedToolbar("mediaEmbed:alignLeft")
+              .setMediaEmbedToolbar("mediaEmbed:alignCenter", "mediaEmbed:alignRight");
+        ObjectNode json = config.toJson();
+
+        assertThat(json.get("mediaEmbed").get("toolbar")).hasSize(2);
+        assertThat(json.get("mediaEmbed").get("toolbar").get(0).asString())
+            .isEqualTo("mediaEmbed:alignCenter");
+    }
+
+    @Test
+    @DisplayName("setMediaEmbedResizable defaults to false when never set")
+    void isMediaEmbedResizableDefaultsFalse() {
+        assertThat(config.isMediaEmbedResizable()).isFalse();
+        config.setMediaEmbed(true); // mediaEmbed exists but no resizable key
+        assertThat(config.isMediaEmbedResizable()).isFalse();
+    }
+
+    @Test
+    @DisplayName("setMediaEmbed and setMediaEmbedResizable coexist in the same mediaEmbed object")
+    void mediaEmbedAndResizableCoexist() {
+        config.setMediaEmbed(true).setMediaEmbedResizable(true);
+        ObjectNode json = config.toJson();
+
+        // 两个 setter 写入同一个 mediaEmbed 对象，互不覆盖
+        assertThat(json.get("mediaEmbed").get("previewsInData").asBoolean()).isTrue();
+        assertThat(json.get("mediaEmbed").get("resizable").asBoolean()).isTrue();
+
+        // 反向顺序同样保留两者
+        CKEditorConfig c2 = new CKEditorConfig();
+        c2.setMediaEmbedResizable(true).setMediaEmbed(false);
+        ObjectNode j2 = c2.toJson();
+        assertThat(j2.get("mediaEmbed").get("resizable").asBoolean()).isTrue();
+        assertThat(j2.get("mediaEmbed").get("previewsInData").asBoolean()).isFalse();
+    }
+
     @Test
     @DisplayName("setMention should create mention config with feeds")
     void setMentionShouldCreateMentionConfig() {
@@ -1416,5 +1516,68 @@ class CKEditorConfigTest {
         assertThatThrownBy(() -> config.setSimpleUpload("http://127.0.0.2/upload"))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("private");
+    }
+
+    // review: PaginationMargins.toJson() 现为 public（与其它内部配置类一致），且序列化正确
+    @Test
+    @DisplayName("PaginationMargins.toJson is public and serializes set margins")
+    void paginationMarginsToJsonPublicAndCorrect() {
+        CKEditorConfig.PaginationMargins margins =
+            new CKEditorConfig.PaginationMargins("10mm", "20mm", "10mm", null);
+
+        ObjectNode json = margins.toJson(); // 此前为 package-private，现可外部调用
+
+        assertThat(json.get("top").asString()).isEqualTo("10mm");
+        assertThat(json.get("right").asString()).isEqualTo("20mm");
+        assertThat(json.get("bottom").asString()).isEqualTo("10mm");
+        assertThat(json.has("left")).isFalse(); // null 不序列化
+    }
+
+    @Test
+    @DisplayName("getToolbarStyle() 必须完整还原 per-button 样式（读-改-写不丢数据）")
+    void toolbarStyleRoundTripPreservesButtonStyles() {
+        // review (Codex): 原测试只验证 toJson() 的写入路径，
+        // 未覆盖 getToolbarStyle() 的还原路径——而后者恰好漏读了 buttonStyles，
+        // 导致 setToolbarStyle(getToolbarStyle()) 永久销毁全部按钮样式。
+        config.setToolbarStyle(CKEditorConfig.ToolbarStyle.builder()
+            .background("#ffffff")
+            .buttonStyle("Bold", CKEditorConfig.ButtonStyle.builder()
+                .background("#ff0000").iconColor("#00ff00").build())
+            .buttonStyle("Italic", CKEditorConfig.ButtonStyle.builder()
+                .hoverBackground("#0000ff").build())
+            .build());
+
+        String before = config.toJson().get("toolbarStyle").toString();
+
+        CKEditorConfig.ToolbarStyle round = config.getToolbarStyle();
+        assertThat(round.getButtonStyles().keySet()).containsExactlyInAnyOrder("Bold", "Italic");
+
+        config.setToolbarStyle(round);
+        assertThat(config.toJson().get("toolbarStyle").toString())
+            .as("读-改-写之后配置必须与原值完全一致")
+            .isEqualTo(before);
+    }
+
+    @Test
+    @DisplayName("toJson()/getConfigs()/getJsonNode() 返回的必须是深拷贝")
+    void snapshotsAreDeepCopies() {
+        // review (Codex): 原测试只验证 map 不可 clear()，
+        // 而 unmodifiableMap 挡不住「修改 map 中的可变 JsonNode 子节点」。
+        config.setToolbar(new String[]{"bold"});
+
+        ((tools.jackson.databind.node.ArrayNode) config.toJson().get("toolbar")).add("EVIL");
+        assertThat(config.toJson().get("toolbar").toString())
+            .as("修改 toJson() 的返回值不得污染内部配置")
+            .doesNotContain("EVIL");
+
+        ((tools.jackson.databind.node.ArrayNode) config.getConfigs().get("toolbar")).add("EVIL2");
+        assertThat(config.toJson().get("toolbar").toString())
+            .as("修改 getConfigs() 的返回值不得污染内部配置")
+            .doesNotContain("EVIL2");
+
+        ((tools.jackson.databind.node.ArrayNode) config.getJsonNode("toolbar")).add("EVIL3");
+        assertThat(config.toJson().get("toolbar").toString())
+            .as("修改 getJsonNode() 的返回值不得污染内部配置")
+            .doesNotContain("EVIL3");
     }
 }

@@ -90,13 +90,13 @@ import static com.wontlost.ckeditor.JsonUtil.*;
  */
 @Tag("vaadin-ckeditor")
 @JsModule("./vaadin-ckeditor/vaadin-ckeditor.ts")
-@NpmPackage(value = "ckeditor5", version = "47.5.0")
-@NpmPackage(value = "lit", version = "^3.3.2")
+@NpmPackage(value = "ckeditor5", version = "48.5.0")
+@NpmPackage(value = "lit", version = "^3.3.3")
 public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel {
 
     private static final Logger logger = Logger.getLogger(VaadinCKEditor.class.getName());
     /** Keep in sync with version field in vaadin-ckeditor.ts */
-    private static final String VERSION = "5.1.0";
+    private static final String VERSION = "5.4.0";
 
     /**
      * Default autosave waiting time in milliseconds.
@@ -128,6 +128,11 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
     private String licenseKey = DEFAULT_LICENSE_KEY;
     private ErrorHandler errorHandler;
     private HtmlSanitizer htmlSanitizer;
+    /**
+     * 是否在客户端内容写入模型时即执行净化。
+     * 默认 false —— 保持既有行为（getValue() 返回原始 HTML），避免破坏现有用户。
+     */
+    private boolean sanitizeOnInput = false;
     private UploadHandler uploadHandler;
     private UploadHandler.UploadConfig uploadConfig;
     private FallbackMode fallbackMode = FallbackMode.TEXTAREA;
@@ -207,6 +212,16 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
             this.contentManager = new ContentManager(htmlSanitizer);
         }
 
+        // 把 errorHandler 接到 eventDispatcher 上。
+        // 公开的 setErrorHandler() 会同时写字段与 dispatcher，但 builder 走的是
+        // setErrorHandlerInternal()，只写字段；若此处不补接，builder 配置的
+        // ErrorHandler 将永远不会被 fireEditorError 调用（静默失效）。
+        // 与上面 contentManager、下面 uploadManager 的装配方式保持一致：
+        // 统一在初始化阶段从字段重建内部管理器。
+        if (errorHandler != null) {
+            eventDispatcher.setErrorHandler(errorHandler);
+        }
+
         // Initialize upload manager if upload handler is configured
         if (uploadHandler != null) {
             // Use WeakReference to avoid memory leaks
@@ -280,6 +295,33 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
         this.editorData = value;
     }
 
+    /**
+     * 返回编辑器当前的 HTML 内容。
+     *
+     * <p><strong>⚠️ 安全提示：本方法返回的是未经净化的原始 HTML。</strong>
+     * 内容来自浏览器端，必须视为不可信输入——CKEditor 的模型过滤属于客户端控制，
+     * 攻击者可绕过它直接调用服务端 RPC 提交任意 HTML。</p>
+     *
+     * <p><strong>这一点对 Binder 尤其重要。</strong>本组件继承 {@code CustomField<String>}，
+     * 因此 {@code binder.forField(editor).bind(...)} 读取的正是本方法，
+     * 而 <em>不会</em> 经过 {@link #setHtmlSanitizer(HtmlSanitizer)} 配置的净化器。
+     * 换言之，仅调用 {@code setHtmlSanitizer(...)} 并不能让 Binder 绑定的值得到净化。</p>
+     *
+     * <p>需要净化后的内容时，请选择其一：</p>
+     * <ul>
+     *   <li>显式调用 {@link #getSanitizedValue()}；或</li>
+     *   <li>调用 {@link #setSanitizeOnInput(boolean) setSanitizeOnInput(true)}，
+     *       使来自客户端的内容在写入模型时即被净化——此时本方法返回的也是净化后的值，
+     *       Binder 路径同样受保护。</li>
+     * </ul>
+     *
+     * <p>之所以默认返回原始 HTML，是为了不破坏既有用户的行为（富文本往返场景确实
+     * 需要原始标记）；净化改为显式开启。</p>
+     *
+     * @return 编辑器 HTML 内容；未开启 {@link #setSanitizeOnInput(boolean)} 时为未净化的原始内容
+     * @see #getSanitizedValue()
+     * @see #setSanitizeOnInput(boolean)
+     */
     @Override
     public String getValue() {
         return editorData;
@@ -297,8 +339,12 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
 
     @Override
     public void setValue(String value) {
-        super.setValue(value);
-        this.editorData = value != null ? value : "";
+        // 先规范化 null 为 ""，再交给 super.setValue。
+        // 否则事件构造时 getValue() 会读到 null（presentation 阶段写入），
+        // 而方法返回后 getValue() 又变为 ""，导致监听器值与最终值不一致（与 issue #85 同源）。
+        String newValue = value != null ? value : "";
+        this.editorData = newValue;
+        super.setValue(newValue);
         getElement().setProperty("editorData", this.editorData);
         updateEditorData(this.editorData);
     }
@@ -307,14 +353,26 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
     protected void setModelValue(String value, boolean fromClient) {
         String oldValue = this.editorData;
         String newValue = value != null ? value : "";
+
+        // 可选的入口净化（setSanitizeOnInput(true) 时启用）。
+        // 只净化 fromClient==true 的值：客户端内容不可信，是真正的信任边界；
+        // 服务端自己 setValue 的内容视为可信，不做改写以免破坏程序化设值。
+        if (sanitizeOnInput && fromClient && htmlSanitizer != null && !newValue.isEmpty()) {
+            newValue = contentManager.getSanitizedValue(newValue);
+        }
         // Only update when value actually changes
         if (java.util.Objects.equals(oldValue, newValue)) {
             return;
         }
-        // super.setModelValue already fires ValueChangeEvent via Vaadin's AbstractField,
-        // so we must not call fireEvent again to avoid duplicate events
-        super.setModelValue(newValue, fromClient);
+        // 必须先更新 editorData，再调用 super.setModelValue。
+        // 原因：本类重写了 getValue() 返回 editorData，而 Vaadin 在
+        // ComponentValueChangeEvent 构造时会调用 getValue() 读取新值
+        // （见 AbstractField.ComponentValueChangeEvent，this.value = hasValue.getValue()）。
+        // 若先 fire 事件再赋值，监听器拿到的将是旧内容（issue #85）。
         this.editorData = newValue;
+        // super.setModelValue 会经由 Vaadin 的 AbstractField 触发 ValueChangeEvent，
+        // 因此不能再额外调用 fireEvent，避免重复事件。
+        super.setModelValue(newValue, fromClient);
     }
 
     @ClientCallable
@@ -324,6 +382,14 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
 
     @ClientCallable
     private void saveEditorData(String data) {
+        saveEditorDataInternal(data);
+    }
+
+    /**
+     * autosave 落盘逻辑（package-private 测试缝隙）：调用回调，捕获其异常并产出成功/失败的
+     * AutosaveEvent。抽出以便在不经过客户端 RPC 的前提下直接测试回调一致性与异常处理（review）。
+     */
+    void saveEditorDataInternal(String data) {
         boolean success = true;
         String errorMessage = null;
 
@@ -383,6 +449,21 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
     @Override
     public boolean isReadOnly() {
         return readOnly;
+    }
+
+    /**
+     * 同步 enabled 状态到前端（issue #46）。
+     *
+     * <p>沿用 Vaadin 推荐的 {@link com.vaadin.flow.component.Component#onEnabledStateChanged(boolean)}
+     * 钩子，而非覆写 {@code setEnabled}——Vaadin 自身负责 disabled 属性的传播，这里只把状态
+     * 推给 CKEditor 前端，使禁用时编辑器不可交互（CKEditor 5 通过只读锁实现禁用）。</p>
+     */
+    @Override
+    public void onEnabledStateChanged(boolean enabled) {
+        super.onEnabledStateChanged(enabled);
+        getElement().setProperty("isEnabled", enabled);
+        getId().ifPresent(id ->
+            getElement().executeJs("this.isEnabled = $0", enabled));
     }
 
     @Override
@@ -526,6 +607,36 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
     public void insertText(String text) {
         getId().ifPresent(id ->
             getElement().executeJs("this.insertText($0)", text));
+    }
+
+    /**
+     * Move the editor caret (collapsed selection) to the very start of the document
+     * and focus the editor.
+     *
+     * <p>Useful when leading block content (e.g. a table used as a letterhead) would
+     * otherwise be auto-selected/highlighted on focus (issue #52). Calling this places
+     * the caret before the first content so nothing is highlighted.</p>
+     */
+    public void setCaretToStart() {
+        getId().ifPresent(id ->
+            getElement().executeJs("this.setCaretToStart()"));
+    }
+
+    /**
+     * Move the editor caret (collapsed selection) to the very end of the document
+     * and focus the editor.
+     */
+    public void setCaretToEnd() {
+        getId().ifPresent(id ->
+            getElement().executeJs("this.setCaretToEnd()"));
+    }
+
+    /**
+     * Programmatically focus the editor's editable area.
+     */
+    public void focusEditor() {
+        getId().ifPresent(id ->
+            getElement().executeJs("this.focusEditor()"));
     }
 
     /**
@@ -691,6 +802,40 @@ public class VaadinCKEditor extends CustomField<String> implements HasAriaLabel 
         this.htmlSanitizer = sanitizer;
         // Update ContentManager so getSanitizedValue() uses the new sanitizer
         this.contentManager = new com.wontlost.ckeditor.internal.ContentManager(sanitizer);
+    }
+
+    /**
+     * 设置是否在客户端内容写入模型时立即净化。
+     *
+     * <p>默认 {@code false}：{@link #getValue()} 返回未净化的原始 HTML，净化仅在
+     * 显式调用 {@link #getSanitizedValue()} 时发生。这保持了既有行为，
+     * 但意味着 {@code Binder} 绑定路径（读取 {@code getValue()}）不会被净化。</p>
+     *
+     * <p>置为 {@code true} 后，所有来自客户端的内容在写入模型时即被
+     * {@link #setHtmlSanitizer(HtmlSanitizer)} 配置的净化器处理，
+     * 于是 {@link #getValue()}、Binder、以及 {@code ValueChangeEvent} 拿到的
+     * 都是已净化的值——即在信任边界处一次性净化，而不依赖每个调用点记得改用
+     * {@code getSanitizedValue()}。</p>
+     *
+     * <p>需要配合 {@link #setHtmlSanitizer(HtmlSanitizer)} 使用；未配置净化器时本开关无效果。
+     * 服务端自行 {@code setValue(...)} 的内容不受影响（视为可信来源）。</p>
+     *
+     * @param sanitizeOnInput true 表示在客户端输入写入模型时净化
+     * @see #setHtmlSanitizer(HtmlSanitizer)
+     * @see #getValue()
+     */
+    public void setSanitizeOnInput(boolean sanitizeOnInput) {
+        this.sanitizeOnInput = sanitizeOnInput;
+    }
+
+    /**
+     * 是否已开启客户端输入的入口净化。
+     *
+     * @return true 表示开启
+     * @see #setSanitizeOnInput(boolean)
+     */
+    public boolean isSanitizeOnInput() {
+        return sanitizeOnInput;
     }
 
     /**

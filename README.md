@@ -32,15 +32,29 @@ A comprehensive CKEditor 5 integration for Vaadin 24+.
 <dependency>
     <groupId>com.wontlost</groupId>
     <artifactId>ckeditor-vaadin</artifactId>
-    <version>5.1.0</version>
+    <version>5.4.0</version>
 </dependency>
 ```
 
 ### Gradle
 
 ```kotlin
-implementation("com.wontlost:ckeditor-vaadin:5.1.0")
+implementation("com.wontlost:ckeditor-vaadin:5.4.0")
 ```
+
+### Compatibility Matrix
+
+| 依赖 | 版本 | 备注 |
+|---|---|---|
+| Vaadin Platform | 25.2.6+ | 25.x 系列 |
+| CKEditor 5 (`ckeditor5`) | 48.5.0 | npm 精确版本 |
+| `ckeditor5-premium-features` | 48.5.0 | 与 `ckeditor5` 必须同版本 |
+| Java | 21+ | Vaadin 25 baseline |
+| Jackson (`tools.jackson.core`) | 3.1.3+ | 由消费端提供 |
+| Jakarta Servlet API | 6.1.0+ | Vaadin 25.2 支持矩阵 |
+| Spring Boot | 4.0.4+ | 推荐（匹配 Jackson 3.1） |
+
+> Unreleased 版本将 CKEditor 47 → 48 的配置兼容层下沉到前端 normalizer；旧顶层 `initialData`/`placeholder`/`label` 与 v47 AI 配置自动迁移到 v48 字段。详见 [CHANGELOG](CHANGELOG.md)。
 
 ## Quick Start
 
@@ -435,6 +449,35 @@ VaadinCKEditor editor = VaadinCKEditor.create()
     .withDependencyMode(DependencyMode.MANUAL)
     .build();
 ```
+
+---
+
+## Testing with TestBench (optional)
+
+An optional `ckeditor-vaadin-testbench` module provides `VaadinCKEditorElement`, a
+type-safe Vaadin TestBench page object for the `vaadin-ckeditor` component.
+
+> ⚠️ Vaadin TestBench is a **commercial (Premium)** feature. The module depends on
+> TestBench with `provided` scope and does not bundle it; you need your own TestBench
+> license to run tests. The core addon has no TestBench dependency.
+
+```xml
+<dependency>
+    <groupId>com.wontlost</groupId>
+    <artifactId>ckeditor-vaadin-testbench</artifactId>
+    <version>5.4.0</version>
+    <scope>test</scope>
+</dependency>
+```
+
+```java
+VaadinCKEditorElement editor = $(VaadinCKEditorElement.class).first();
+editor.setData("<p>Hello</p>");
+assertEquals("<p>Hello</p>", editor.getData());
+```
+
+See [`ckeditor-vaadin-testbench/README.md`](ckeditor-vaadin-testbench/README.md) for the
+full API and setup.
 
 ---
 
